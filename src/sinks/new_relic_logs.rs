@@ -1,16 +1,20 @@
 use crate::{
-    sinks::http::{HttpMethod, HttpSinkConfig},
-    sinks::util::{
-        encoding::{EncodingConfigWithDefault, EncodingConfiguration},
-        service2::TowerRequestConfig,
-        BatchBytesConfig, Compression,
+    config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
+    sinks::{
+        http::{HttpMethod, HttpSinkConfig},
+        util::{
+            encoding::EncodingConfig, http::RequestConfig, BatchConfig, Compression, Concurrency,
+            TowerRequestConfig,
+        },
     },
-    topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
 };
-use http02::Uri;
+use http::Uri;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+
+// New Relic Logs API accepts payloads up to 1MB (10^6 bytes)
+const MAX_PAYLOAD_SIZE: usize = 1_000_000_usize;
 
 #[derive(Debug, Snafu)]
 enum BuildError {
@@ -18,6 +22,11 @@ enum BuildError {
         "Missing authentication key, must provide either 'license_key' or 'insert_key'"
     ))]
     MissingAuthParam,
+    #[snafu(display(
+        "Too high batch max size. The value must be {} bytes or less",
+        MAX_PAYLOAD_SIZE
+    ))]
+    BatchMaxSize,
 }
 
 #[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone, Derivative)]
@@ -29,16 +38,16 @@ pub enum NewRelicLogsRegion {
     Eu,
 }
 
-#[derive(Deserialize, Serialize, Debug, Derivative, Clone)]
-#[derivative(Default)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct NewRelicLogsConfig {
     pub license_key: Option<String>,
     pub insert_key: Option<String>,
     pub region: Option<NewRelicLogsRegion>,
-    #[serde(skip_serializing_if = "skip_serializing_if_default", default)]
-    pub encoding: EncodingConfigWithDefault<Encoding>,
+    pub encoding: EncodingConfig<Encoding>,
     #[serde(default)]
-    pub batch: BatchBytesConfig,
+    pub compression: Compression,
+    #[serde(default)]
+    pub batch: BatchConfig,
 
     #[serde(default)]
     pub request: TowerRequestConfig,
@@ -48,11 +57,15 @@ inventory::submit! {
     SinkDescription::new::<NewRelicLogsConfig>("new_relic_logs")
 }
 
-#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone, Derivative)]
+impl GenerateConfig for NewRelicLogsConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(Self::with_encoding(Encoding::Json)).unwrap()
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone)]
 #[serde(rename_all = "snake_case")]
-#[derivative(Default)]
 pub enum Encoding {
-    #[derivative(Default)]
     Json,
 }
 
@@ -64,18 +77,15 @@ impl From<Encoding> for crate::sinks::http::Encoding {
     }
 }
 
-// There is another one of these in `util::encoding`, but this one is specialized for New Relic.
-/// For encodings, answers "Is it possible to skip serializing this value, because it's the
-/// default?"
-pub(crate) fn skip_serializing_if_default(e: &EncodingConfigWithDefault<Encoding>) -> bool {
-    e.codec() == &Encoding::default()
-}
-
+#[async_trait::async_trait]
 #[typetag::serde(name = "new_relic_logs")]
 impl SinkConfig for NewRelicLogsConfig {
-    fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+    async fn build(
+        &self,
+        cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
         let http_conf = self.create_config()?;
-        http_conf.build(cx)
+        http_conf.build(cx).await
     }
 
     fn input_type(&self) -> DataType {
@@ -88,6 +98,18 @@ impl SinkConfig for NewRelicLogsConfig {
 }
 
 impl NewRelicLogsConfig {
+    fn with_encoding(encoding: Encoding) -> Self {
+        Self {
+            license_key: None,
+            insert_key: None,
+            region: None,
+            encoding: encoding.into(),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+        }
+    }
+
     fn create_config(&self) -> crate::Result<HttpSinkConfig> {
         let mut headers: IndexMap<String, String> = IndexMap::new();
 
@@ -104,29 +126,34 @@ impl NewRelicLogsConfig {
             NewRelicLogsRegion::Eu => Uri::from_static("https://log-api.eu.newrelic.com/log/v1"),
         };
 
-        let batch = BatchBytesConfig {
-            // The max request size is 10MiB, so in order to be comfortably
-            // within this we batch up to 5MiB.
-            max_size: Some(self.batch.max_size.unwrap_or(bytesize::mib(5u64) as usize)),
-            ..self.batch
+        let batch = self.batch.use_size_as_bytes()?;
+        let max_payload_size = batch.max_bytes.unwrap_or(MAX_PAYLOAD_SIZE);
+        if max_payload_size > MAX_PAYLOAD_SIZE {
+            return Err(Box::new(BuildError::BatchMaxSize));
+        }
+        let batch = BatchConfig {
+            max_bytes: Some(batch.max_bytes.unwrap_or(MAX_PAYLOAD_SIZE)),
+            max_events: None,
+            ..batch
         };
 
-        let request = TowerRequestConfig {
+        let tower = TowerRequestConfig {
             // The default throughput ceiling defaults are relatively
             // conservative so we crank them up for New Relic.
-            in_flight_limit: Some(self.request.in_flight_limit.unwrap_or(100)),
+            concurrency: (self.request.concurrency).if_none(Concurrency::Fixed(100)),
             rate_limit_num: Some(self.request.rate_limit_num.unwrap_or(100)),
             ..self.request
         };
 
+        let request = RequestConfig { tower, headers };
+
         Ok(HttpSinkConfig {
             uri: uri.into(),
             method: Some(HttpMethod::Post),
-            healthcheck_uri: None,
             auth: None,
-            headers: Some(headers),
-            compression: Compression::None,
-            encoding: self.encoding.clone().without_default(),
+            headers: None,
+            compression: self.compression,
+            encoding: self.encoding.clone().into_encoding(),
 
             batch,
             request,
@@ -140,24 +167,30 @@ impl NewRelicLogsConfig {
 mod tests {
     use super::*;
     use crate::{
-        event::Event,
-        runtime::Runtime,
-        test_util::{next_addr, shutdown_on_idle},
-        topology::config::SinkConfig,
+        config::SinkConfig,
+        sinks::util::{encoding::EncodingConfiguration, test::build_test_server, Concurrency},
+        test_util::next_addr,
+        Event,
     };
-    use bytes::Buf;
-    use futures01::{stream, sync::mpsc, Future, Sink, Stream};
-    use hyper::service::service_fn_ok;
-    use hyper::{Body, Request, Response, Server};
+    use bytes::buf::BufExt;
+    use futures::{stream, StreamExt};
+    use hyper::Method;
     use serde_json::Value;
     use std::io::BufRead;
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<NewRelicLogsConfig>();
+    }
 
     #[test]
     fn new_relic_logs_check_config_no_auth() {
         assert_eq!(
             format!(
                 "{}",
-                NewRelicLogsConfig::default().create_config().unwrap_err()
+                NewRelicLogsConfig::with_encoding(Encoding::Json)
+                    .create_config()
+                    .unwrap_err()
             ),
             "Missing authentication key, must provide either 'license_key' or 'insert_key'"
                 .to_owned(),
@@ -166,24 +199,24 @@ mod tests {
 
     #[test]
     fn new_relic_logs_check_config_defaults() {
-        let mut nr_config = NewRelicLogsConfig::default();
+        let mut nr_config = NewRelicLogsConfig::with_encoding(Encoding::Json);
         nr_config.license_key = Some("foo".to_owned());
         let http_config = nr_config.create_config().unwrap();
 
         assert_eq!(
-            format!("{}", http_config.uri),
+            format!("{}", http_config.uri.uri),
             "https://log-api.newrelic.com/log/v1".to_string()
         );
         assert_eq!(http_config.method, Some(HttpMethod::Post));
         assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+        assert_eq!(http_config.batch.max_bytes, Some(MAX_PAYLOAD_SIZE));
         assert_eq!(
-            http_config.batch.max_size,
-            Some(bytesize::mib(5u64) as usize)
+            http_config.request.tower.concurrency,
+            Concurrency::Fixed(100)
         );
-        assert_eq!(http_config.request.in_flight_limit, Some(100));
-        assert_eq!(http_config.request.rate_limit_num, Some(100));
+        assert_eq!(http_config.request.tower.rate_limit_num, Some(100));
         assert_eq!(
-            http_config.headers.unwrap()["X-License-Key"],
+            http_config.request.headers["X-License-Key"],
             "foo".to_owned()
         );
         assert!(http_config.tls.is_none());
@@ -192,29 +225,29 @@ mod tests {
 
     #[test]
     fn new_relic_logs_check_config_custom() {
-        let mut nr_config = NewRelicLogsConfig::default();
+        let mut nr_config = NewRelicLogsConfig::with_encoding(Encoding::Json);
         nr_config.insert_key = Some("foo".to_owned());
         nr_config.region = Some(NewRelicLogsRegion::Eu);
-        nr_config.batch.max_size = Some(bytesize::mib(8u64) as usize);
-        nr_config.request.in_flight_limit = Some(12);
+        nr_config.batch.max_size = Some(MAX_PAYLOAD_SIZE);
+        nr_config.request.concurrency = Concurrency::Fixed(12);
         nr_config.request.rate_limit_num = Some(24);
 
         let http_config = nr_config.create_config().unwrap();
 
         assert_eq!(
-            format!("{}", http_config.uri),
+            format!("{}", http_config.uri.uri),
             "https://log-api.eu.newrelic.com/log/v1".to_string()
         );
         assert_eq!(http_config.method, Some(HttpMethod::Post));
         assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+        assert_eq!(http_config.batch.max_bytes, Some(MAX_PAYLOAD_SIZE));
         assert_eq!(
-            http_config.batch.max_size,
-            Some(bytesize::mib(8u64) as usize)
+            http_config.request.tower.concurrency,
+            Concurrency::Fixed(12)
         );
-        assert_eq!(http_config.request.in_flight_limit, Some(12));
-        assert_eq!(http_config.request.rate_limit_num, Some(24));
+        assert_eq!(http_config.request.tower.rate_limit_num, Some(24));
         assert_eq!(
-            http_config.headers.unwrap()["X-Insert-Key"],
+            http_config.request.headers["X-Insert-Key"],
             "foo".to_owned()
         );
         assert!(http_config.tls.is_none());
@@ -226,12 +259,13 @@ mod tests {
         let config = r#"
         insert_key = "foo"
         region = "eu"
+        encoding = "json"
 
         [batch]
-        max_size = 8388608
+        max_size = 838860
 
         [request]
-        in_flight_limit = 12
+        concurrency = 12
         rate_limit_num = 24
     "#;
         let nr_config: NewRelicLogsConfig = toml::from_str(&config).unwrap();
@@ -239,94 +273,72 @@ mod tests {
         let http_config = nr_config.create_config().unwrap();
 
         assert_eq!(
-            format!("{}", http_config.uri),
+            format!("{}", http_config.uri.uri),
             "https://log-api.eu.newrelic.com/log/v1".to_string()
         );
         assert_eq!(http_config.method, Some(HttpMethod::Post));
         assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+        assert_eq!(http_config.batch.max_bytes, Some(838860));
         assert_eq!(
-            http_config.batch.max_size,
-            Some(bytesize::mib(8u64) as usize)
+            http_config.request.tower.concurrency,
+            Concurrency::Fixed(12)
         );
-        assert_eq!(http_config.request.in_flight_limit, Some(12));
-        assert_eq!(http_config.request.rate_limit_num, Some(24));
+        assert_eq!(http_config.request.tower.rate_limit_num, Some(24));
         assert_eq!(
-            http_config.headers.unwrap()["X-Insert-Key"],
+            http_config.request.headers["X-Insert-Key"],
             "foo".to_owned()
         );
         assert!(http_config.tls.is_none());
         assert!(http_config.auth.is_none());
     }
 
-    fn build_test_server(
-        addr: &std::net::SocketAddr,
-    ) -> (
-        mpsc::Receiver<(http::request::Parts, hyper::Chunk)>,
-        stream_cancel::Trigger,
-        impl Future<Item = (), Error = ()>,
-    ) {
-        let (tx, rx) = mpsc::channel(100);
-        let service = move || {
-            let tx = tx.clone();
-            service_fn_ok(move |req: Request<Body>| {
-                let (parts, body) = req.into_parts();
+    #[test]
+    #[should_panic]
+    fn new_relic_logs_check_config_custom_from_toml_batch_max_size_too_high() {
+        let config = r#"
+        insert_key = "foo"
+        region = "eu"
+        encoding = "json"
 
-                let tx = tx.clone();
-                tokio01::spawn(
-                    body.concat2()
-                        .map_err(|e| panic!(e))
-                        .and_then(|body| tx.send((parts, body)))
-                        .map(|_| ())
-                        .map_err(|e| panic!(e)),
-                );
+        [batch]
+        max_size = 8388600
 
-                Response::new(Body::empty())
-            })
-        };
+        [request]
+        concurrency = 12
+        rate_limit_num = 24
+    "#;
+        let nr_config: NewRelicLogsConfig = toml::from_str(&config).unwrap();
 
-        let (trigger, tripwire) = stream_cancel::Tripwire::new();
-        let server = Server::bind(addr)
-            .serve(service)
-            .with_graceful_shutdown(tripwire)
-            .map_err(|e| panic!("server error: {}", e));
-
-        (rx, trigger, server)
+        nr_config.create_config().unwrap();
     }
 
-    #[test]
-    fn new_relic_logs_happy_path() {
+    #[tokio::test]
+    async fn new_relic_logs_happy_path() {
         let in_addr = next_addr();
 
-        let mut nr_config = NewRelicLogsConfig::default();
+        let mut nr_config = NewRelicLogsConfig::with_encoding(Encoding::Json);
         nr_config.license_key = Some("foo".to_owned());
         let mut http_config = nr_config.create_config().unwrap();
         http_config.uri = format!("http://{}/fake_nr", in_addr)
-            .parse::<http02::Uri>()
+            .parse::<http::Uri>()
             .unwrap()
             .into();
 
-        let mut rt = Runtime::new().unwrap();
-
-        let (sink, _healthcheck) = http_config
-            .build(SinkContext::new_test(rt.executor()))
-            .unwrap();
-        let (rx, trigger, server) = build_test_server(&in_addr);
+        let (sink, _healthcheck) = http_config.build(SinkContext::new_test()).await.unwrap();
+        let (rx, trigger, server) = build_test_server(in_addr);
 
         let input_lines = (0..100).map(|i| format!("msg {}", i)).collect::<Vec<_>>();
-        let events = stream::iter_ok(input_lines.clone().into_iter().map(Event::from));
+        let events = stream::iter(input_lines.clone()).map(Event::from);
+        let pump = sink.run(events);
 
-        let pump = sink.send_all(events);
+        tokio::spawn(server);
 
-        rt.spawn(server);
-
-        let _ = rt.block_on(pump).unwrap();
+        pump.await.unwrap();
         drop(trigger);
 
         let output_lines = rx
-            .wait()
-            .map(Result::unwrap)
-            .map(|(parts, body)| {
-                assert_eq!(hyper::Method::POST, parts.method);
+            .flat_map(|(parts, body)| {
+                assert_eq!(Method::POST, parts.method);
                 assert_eq!("/fake_nr", parts.uri.path());
                 assert_eq!(
                     parts
@@ -335,20 +347,18 @@ mod tests {
                         .and_then(|v| v.to_str().ok()),
                     Some("foo")
                 );
-                body
+                stream::iter(body.reader().lines())
             })
-            .map(hyper::Chunk::reader)
-            .flat_map(BufRead::lines)
             .map(Result::unwrap)
-            .flat_map(|s| -> Vec<String> {
-                let vals: Vec<Value> = serde_json::from_str(&s).unwrap();
-                vals.iter()
-                    .map(|v| v.get("message").unwrap().as_str().unwrap().to_owned())
-                    .collect()
+            .flat_map(|line| {
+                let vals: Vec<Value> = serde_json::from_str(&line).unwrap();
+                stream::iter(
+                    vals.into_iter()
+                        .map(|v| v.get("message").unwrap().as_str().unwrap().to_owned()),
+                )
             })
-            .collect::<Vec<_>>();
-
-        shutdown_on_idle(rt);
+            .collect::<Vec<_>>()
+            .await;
 
         assert_eq!(input_lines, output_lines);
     }

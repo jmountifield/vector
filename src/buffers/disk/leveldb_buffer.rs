@@ -1,4 +1,5 @@
 use crate::event::{proto, Event};
+use bytes::Bytes;
 use futures01::{
     task::{self, AtomicTask, Task},
     Async, AsyncSink, Poll, Sink, Stream,
@@ -25,6 +26,10 @@ use std::{
 
 use super::{DataDirOpenError, Error};
 use crate::buffers::Acker;
+
+/// How much of disk buffer needs to be deleted before we trigger compaction.
+/// <0,1>
+const MAX_UNCOMPACTED: f64 = 0.1;
 
 #[derive(Copy, Clone, Debug)]
 struct Key(pub usize);
@@ -95,7 +100,8 @@ impl Sink for Writer {
 
             self.poll_complete()?;
 
-            let event = proto::EventWrapper::decode(value).unwrap().into();
+            let buf = Bytes::from(value);
+            let event = proto::EventWrapper::decode(buf).unwrap().into();
             return Ok(AsyncSink::NotReady(event));
         }
 
@@ -153,8 +159,10 @@ pub struct Reader {
     blocked_write_tasks: Arc<Mutex<Vec<Task>>>,
     current_size: Arc<AtomicUsize>,
     ack_counter: Arc<AtomicUsize>,
+    uncompacted_size: usize,
     unacked_sizes: VecDeque<usize>,
     buffer: Vec<Vec<u8>>,
+    max_uncompacted_size: usize,
 }
 
 // Writebatch isn't Send, but the leveldb docs explicitly say that it's okay to share across threads
@@ -189,13 +197,14 @@ impl Stream for Reader {
             self.unacked_sizes.push_back(value.len());
             self.read_offset += 1;
 
-            match proto::EventWrapper::decode(value) {
+            let buf = Bytes::from(value);
+            match proto::EventWrapper::decode(buf) {
                 Ok(event) => {
                     let event = Event::from(event);
                     Ok(Async::Ready(Some(event)))
                 }
-                Err(err) => {
-                    error!("Error deserializing proto: {:?}", err);
+                Err(error) => {
+                    error!(message = "Error deserializing proto.", %error);
                     debug_assert!(false);
                     self.poll()
                 }
@@ -212,6 +221,8 @@ impl Stream for Reader {
 impl Drop for Reader {
     fn drop(&mut self) {
         self.delete_acked();
+        // Compact on every shutdown
+        self.compact();
     }
 }
 
@@ -236,14 +247,26 @@ impl Reader {
 
             self.delete_offset = new_offset;
 
-            self.db.compact(&Key(0), &Key(self.delete_offset));
-
             let size_deleted = self.unacked_sizes.drain(..num_to_delete).sum();
             self.current_size.fetch_sub(size_deleted, Ordering::Relaxed);
+
+            self.uncompacted_size += size_deleted;
+            if self.uncompacted_size > self.max_uncompacted_size {
+                self.compact();
+            }
         }
 
         for task in self.blocked_write_tasks.lock().unwrap().drain(..) {
             task.notify();
+        }
+    }
+
+    fn compact(&mut self) {
+        if self.uncompacted_size > 0 {
+            self.uncompacted_size = 0;
+
+            debug!("Compacting disk buffer.");
+            self.db.compact(&Key(0), &Key(self.delete_offset));
         }
     }
 }
@@ -255,6 +278,11 @@ impl super::DiskBuffer for Buffer {
     type Reader = Reader;
 
     fn build(path: PathBuf, max_size: usize) -> Result<(Self::Writer, Self::Reader, Acker), Error> {
+        // New `max_size` of the buffer is used for storing the unacked events.
+        // The rest is used as a buffer which when filled triggers compaction.
+        let max_uncompacted_size = (max_size as f64 * MAX_UNCOMPACTED) as usize;
+        let max_size = max_size - max_uncompacted_size;
+
         let mut options = Options::new();
         options.create_if_missing = true;
 
@@ -294,7 +322,7 @@ impl super::DiskBuffer for Buffer {
             current_size: Arc::clone(&current_size),
         };
 
-        let reader = Reader {
+        let mut reader = Reader {
             db: Arc::clone(&db),
             write_notifier: Arc::clone(&write_notifier),
             blocked_write_tasks,
@@ -302,9 +330,13 @@ impl super::DiskBuffer for Buffer {
             delete_offset: head,
             current_size,
             ack_counter,
+            max_uncompacted_size,
+            uncompacted_size: 1,
             unacked_sizes: VecDeque::new(),
             buffer: Vec::new(),
         };
+        // Compact on every start
+        reader.compact();
 
         Ok((writer, reader, acker))
     }

@@ -1,21 +1,23 @@
-mod tcp;
+pub mod tcp;
 mod udp;
 #[cfg(unix)]
 mod unix;
 
 use super::util::TcpSource;
 use crate::{
-    event::{self, Event},
+    config::{
+        log_schema, DataType, GenerateConfig, GlobalOptions, Resource, SourceConfig,
+        SourceDescription,
+    },
     shutdown::ShutdownSignal,
     tls::MaybeTlsSettings,
-    topology::config::{DataType, GlobalOptions, SourceConfig, SourceDescription},
+    Pipeline,
 };
-use futures01::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-// TODO: add back when serde-rs/serde#1358 is addressed
+// TODO: add back when https://github.com/serde-rs/serde/issues/1358 is addressed
 // #[serde(deny_unknown_fields)]
 pub struct SocketConfig {
     #[serde(flatten)]
@@ -28,12 +30,19 @@ pub enum Mode {
     Tcp(tcp::TcpConfig),
     Udp(udp::UdpConfig),
     #[cfg(unix)]
-    Unix(unix::UnixConfig),
+    UnixDatagram(unix::UnixConfig),
+    #[cfg(unix)]
+    #[serde(alias = "unix")]
+    UnixStream(unix::UnixConfig),
 }
 
 impl SocketConfig {
-    pub fn make_tcp_config(addr: SocketAddr) -> Self {
-        tcp::TcpConfig::new(addr.into()).into()
+    pub fn new_tcp(tcp_config: tcp::TcpConfig) -> Self {
+        tcp_config.into()
+    }
+
+    pub fn make_basic_tcp_config(addr: SocketAddr) -> Self {
+        tcp::TcpConfig::from_address(addr.into()).into()
     }
 }
 
@@ -53,56 +62,80 @@ impl From<udp::UdpConfig> for SocketConfig {
     }
 }
 
-#[cfg(unix)]
-impl From<unix::UnixConfig> for SocketConfig {
-    fn from(config: unix::UnixConfig) -> Self {
-        SocketConfig {
-            mode: Mode::Unix(config),
-        }
+inventory::submit! {
+    SourceDescription::new::<SocketConfig>("socket")
+}
+
+impl GenerateConfig for SocketConfig {
+    fn generate_config() -> toml::Value {
+        toml::from_str(
+            r#"mode = "tcp"
+            address = "0.0.0.0:9000""#,
+        )
+        .unwrap()
     }
 }
 
-inventory::submit! {
-    SourceDescription::new_without_default::<SocketConfig>("socket")
-}
-
+#[async_trait::async_trait]
 #[typetag::serde(name = "socket")]
 impl SourceConfig for SocketConfig {
-    fn build(
+    async fn build(
         &self,
         _name: &str,
         _globals: &GlobalOptions,
         shutdown: ShutdownSignal,
-        out: mpsc::Sender<Event>,
+        out: Pipeline,
     ) -> crate::Result<super::Source> {
         match self.mode.clone() {
             Mode::Tcp(config) => {
                 let tcp = tcp::RawTcpSource {
                     config: config.clone(),
                 };
-                let tls = MaybeTlsSettings::from_config(&config.tls, true)?;
+                let tls = MaybeTlsSettings::from_config(&config.tls(), true)?;
                 tcp.run(
-                    config.address,
-                    config.shutdown_timeout_secs,
+                    config.address(),
+                    config.keepalive(),
+                    config.shutdown_timeout_secs(),
                     tls,
+                    config.receive_buffer_bytes(),
                     shutdown,
                     out,
                 )
             }
             Mode::Udp(config) => {
                 let host_key = config
-                    .host_key
+                    .host_key()
                     .clone()
-                    .unwrap_or(event::log_schema().host_key().clone());
-                Ok(udp::udp(config.address, host_key, shutdown, out))
+                    .unwrap_or_else(|| log_schema().host_key().to_string());
+                Ok(udp::udp(
+                    config.address(),
+                    config.max_length(),
+                    host_key,
+                    #[cfg(unix)]
+                    config.receive_buffer_bytes(),
+                    shutdown,
+                    out,
+                ))
             }
             #[cfg(unix)]
-            Mode::Unix(config) => {
+            Mode::UnixDatagram(config) => {
                 let host_key = config
                     .host_key
-                    .clone()
-                    .unwrap_or(event::log_schema().host_key().to_string());
-                Ok(unix::unix(
+                    .unwrap_or_else(|| log_schema().host_key().to_string());
+                Ok(unix::unix_datagram(
+                    config.path,
+                    config.max_length,
+                    host_key,
+                    shutdown,
+                    out,
+                ))
+            }
+            #[cfg(unix)]
+            Mode::UnixStream(config) => {
+                let host_key = config
+                    .host_key
+                    .unwrap_or_else(|| log_schema().host_key().to_string());
+                Ok(unix::unix_stream(
                     config.path,
                     config.max_length,
                     host_key,
@@ -120,109 +153,125 @@ impl SourceConfig for SocketConfig {
     fn source_type(&self) -> &'static str {
         "socket"
     }
+
+    fn resources(&self) -> Vec<Resource> {
+        match self.mode.clone() {
+            Mode::Tcp(tcp) => vec![tcp.address().into()],
+            Mode::Udp(udp) => vec![Resource::udp(udp.address())],
+            #[cfg(unix)]
+            Mode::UnixDatagram(_) => vec![],
+            #[cfg(unix)]
+            Mode::UnixStream(_) => vec![],
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::tcp::TcpConfig;
-    use super::udp::UdpConfig;
-    #[cfg(unix)]
-    use super::unix::UnixConfig;
-    use super::SocketConfig;
-    use crate::dns::Resolver;
-    use crate::event;
-    use crate::runtime;
-    use crate::shutdown::{ShutdownSignal, SourceShutdownCoordinator};
-    use crate::sinks::util::tcp::TcpSink;
-    use crate::test_util::{
-        block_on, collect_n, next_addr, send_lines, send_lines_tls, wait_for_tcp, CollectN,
+    use super::{tcp::TcpConfig, udp::UdpConfig, SocketConfig};
+    use crate::{
+        config::{log_schema, GlobalOptions, SinkContext, SourceConfig},
+        shutdown::{ShutdownSignal, SourceShutdownCoordinator},
+        sinks::util::tcp::TcpSinkConfig,
+        test_util::{
+            collect_n, next_addr, random_string, send_lines, send_lines_tls, wait_for_tcp,
+        },
+        tls::{self, TlsConfig, TlsOptions},
+        Event, Pipeline,
     };
-    use crate::tls::{MaybeTlsSettings, TlsConfig, TlsOptions};
-    use crate::topology::config::{GlobalOptions, SourceConfig};
     use bytes::Bytes;
-    #[cfg(unix)]
-    use futures01::Sink;
-    use futures01::{
-        stream,
-        sync::{mpsc, oneshot},
-        Future, Stream,
+    use futures::{stream, StreamExt};
+    use std::{
+        net::{SocketAddr, UdpSocket},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
     };
-    use std::net::UdpSocket;
-    #[cfg(unix)]
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::{net::SocketAddr, thread, time::Duration, time::Instant};
-    #[cfg(unix)]
-    use tokio01::codec::{FramedWrite, LinesCodec};
-    #[cfg(unix)]
-    use tokio_uds::UnixStream;
 
-    //////// TCP TESTS ////////
+    use tokio::{
+        task::JoinHandle,
+        time::{Duration, Instant},
+    };
+    #[cfg(unix)]
+    use {
+        super::{unix::UnixConfig, Mode},
+        futures::SinkExt,
+        std::path::PathBuf,
+        tokio::{
+            net::{UnixDatagram, UnixStream},
+            task::yield_now,
+        },
+        tokio_util::codec::{FramedWrite, LinesCodec},
+    };
+
     #[test]
-    fn tcp_it_includes_host() {
-        let (tx, rx) = mpsc::channel(1);
-
-        let addr = next_addr();
-
-        let server = SocketConfig::from(TcpConfig::new(addr.into()))
-            .build(
-                "default",
-                &GlobalOptions::default(),
-                ShutdownSignal::noop(),
-                tx,
-            )
-            .unwrap();
-        let mut rt = runtime::Runtime::new().unwrap();
-        rt.spawn(server);
-        wait_for_tcp(addr);
-
-        rt.block_on(send_lines(addr, vec!["test".to_owned()].into_iter()))
-            .unwrap();
-
-        let event = rx.wait().next().unwrap().unwrap();
-        assert_eq!(
-            event.as_log()[&event::log_schema().host_key()],
-            "127.0.0.1".into()
-        );
+    fn generate_config() {
+        crate::test_util::test_generate_config::<SocketConfig>();
     }
 
-    #[test]
-    fn tcp_it_includes_source_type() {
-        let (tx, rx) = mpsc::channel(1);
-
+    //////// TCP TESTS ////////
+    #[tokio::test]
+    async fn tcp_it_includes_host() {
+        let (tx, mut rx) = Pipeline::new_test();
         let addr = next_addr();
 
-        let server = SocketConfig::from(TcpConfig::new(addr.into()))
+        let server = SocketConfig::from(TcpConfig::from_address(addr.into()))
             .build(
                 "default",
                 &GlobalOptions::default(),
                 ShutdownSignal::noop(),
                 tx,
             )
+            .await
             .unwrap();
-        let mut rt = runtime::Runtime::new().unwrap();
-        rt.spawn(server);
-        wait_for_tcp(addr);
+        tokio::spawn(server);
 
-        rt.block_on(send_lines(addr, vec!["test".to_owned()].into_iter()))
+        wait_for_tcp(addr).await;
+        send_lines(addr, vec!["test".to_owned()].into_iter())
+            .await
             .unwrap();
 
-        let event = rx.wait().next().unwrap().unwrap();
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.as_log()[log_schema().host_key()], "127.0.0.1".into());
+    }
+
+    #[tokio::test]
+    async fn tcp_it_includes_source_type() {
+        let (tx, mut rx) = Pipeline::new_test();
+        let addr = next_addr();
+
+        let server = SocketConfig::from(TcpConfig::from_address(addr.into()))
+            .build(
+                "default",
+                &GlobalOptions::default(),
+                ShutdownSignal::noop(),
+                tx,
+            )
+            .await
+            .unwrap();
+        tokio::spawn(server);
+
+        wait_for_tcp(addr).await;
+        send_lines(addr, vec!["test".to_owned()].into_iter())
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
         assert_eq!(
-            event.as_log()[event::log_schema().source_type_key()],
+            event.as_log()[log_schema().source_type_key()],
             "socket".into()
         );
     }
 
-    #[test]
-    fn tcp_continue_after_long_line() {
-        let (tx, rx) = mpsc::channel(10);
-
+    #[tokio::test]
+    async fn tcp_continue_after_long_line() {
+        let (tx, mut rx) = Pipeline::new_test();
         let addr = next_addr();
 
-        let mut config = TcpConfig::new(addr.into());
-        config.max_length = 10;
+        let mut config = TcpConfig::from_address(addr.into());
+        config.set_max_length(10);
 
         let server = SocketConfig::from(config)
             .build(
@@ -231,10 +280,9 @@ mod test {
                 ShutdownSignal::noop(),
                 tx,
             )
+            .await
             .unwrap();
-        let mut rt = runtime::Runtime::new().unwrap();
-        rt.spawn(server);
-        wait_for_tcp(addr);
+        tokio::spawn(server);
 
         let lines = vec![
             "short".to_owned(),
@@ -242,37 +290,75 @@ mod test {
             "more short".to_owned(),
         ];
 
-        rt.block_on(send_lines(addr, lines.into_iter())).unwrap();
+        wait_for_tcp(addr).await;
+        send_lines(addr, lines.into_iter()).await.unwrap();
 
-        let (event, rx) = block_on(rx.into_future()).unwrap();
-        assert_eq!(
-            event.unwrap().as_log()[&event::log_schema().message_key()],
-            "short".into()
-        );
+        let event = rx.next().await.unwrap();
+        assert_eq!(event.as_log()[log_schema().message_key()], "short".into());
 
-        let (event, _rx) = block_on(rx.into_future()).unwrap();
+        let event = rx.next().await.unwrap();
         assert_eq!(
-            event.unwrap().as_log()[&event::log_schema().message_key()],
+            event.as_log()[log_schema().message_key()],
             "more short".into()
         );
     }
 
-    #[test]
-    fn tcp_with_tls() {
-        let (tx, rx) = mpsc::channel(10);
-
+    #[tokio::test]
+    async fn tcp_with_tls() {
+        let (tx, mut rx) = Pipeline::new_test();
         let addr = next_addr();
 
-        let mut config = TcpConfig::new(addr.into());
-        config.max_length = 10;
-        config.tls = Some(TlsConfig {
+        let mut config = TcpConfig::from_address(addr.into());
+        config.set_max_length(10);
+        config.set_tls(Some(TlsConfig::test_config()));
+
+        let server = SocketConfig::from(config)
+            .build(
+                "default",
+                &GlobalOptions::default(),
+                ShutdownSignal::noop(),
+                tx,
+            )
+            .await
+            .unwrap();
+        tokio::spawn(server);
+
+        let lines = vec![
+            "short".to_owned(),
+            "this is too long".to_owned(),
+            "more short".to_owned(),
+        ];
+
+        wait_for_tcp(addr).await;
+        send_lines_tls(addr, "localhost".into(), lines.into_iter(), None)
+            .await
+            .unwrap();
+
+        let event = rx.next().await.unwrap();
+        assert_eq!(event.as_log()[log_schema().message_key()], "short".into());
+
+        let event = rx.next().await.unwrap();
+        assert_eq!(
+            event.as_log()[log_schema().message_key()],
+            "more short".into()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_with_tls_intermediate_ca() {
+        let (tx, mut rx) = Pipeline::new_test();
+        let addr = next_addr();
+
+        let mut config = TcpConfig::from_address(addr.into());
+        config.set_max_length(10);
+        config.set_tls(Some(TlsConfig {
             enabled: Some(true),
             options: TlsOptions {
-                crt_path: Some("tests/data/localhost.crt".into()),
-                key_path: Some("tests/data/localhost.key".into()),
+                crt_file: Some("tests/data/Chain_with_intermediate.crt".into()),
+                key_file: Some("tests/data/Crt_from_intermediate.key".into()),
                 ..Default::default()
             },
-        });
+        }));
 
         let server = SocketConfig::from(config)
             .build(
@@ -281,10 +367,9 @@ mod test {
                 ShutdownSignal::noop(),
                 tx,
             )
+            .await
             .unwrap();
-        let mut rt = runtime::Runtime::new().unwrap();
-        rt.spawn(server);
-        wait_for_tcp(addr);
+        tokio::spawn(server);
 
         let lines = vec![
             "short".to_owned(),
@@ -292,233 +377,129 @@ mod test {
             "more short".to_owned(),
         ];
 
-        rt.block_on(send_lines_tls(addr, "localhost".into(), lines.into_iter()))
-            .unwrap();
+        wait_for_tcp(addr).await;
+        send_lines_tls(
+            addr,
+            "localhost".into(),
+            lines.into_iter(),
+            std::path::Path::new(tls::TEST_PEM_CA_PATH),
+        )
+        .await
+        .unwrap();
 
-        let (event, rx) = block_on(rx.into_future()).unwrap();
+        let event = rx.next().await.unwrap();
         assert_eq!(
-            event.unwrap().as_log()[&event::log_schema().message_key()],
+            event.as_log()[crate::config::log_schema().message_key()],
             "short".into()
         );
 
-        let (event, _rx) = block_on(rx.into_future()).unwrap();
+        let event = rx.next().await.unwrap();
         assert_eq!(
-            event.unwrap().as_log()[&event::log_schema().message_key()],
+            event.as_log()[crate::config::log_schema().message_key()],
             "more short".into()
         );
     }
 
-    #[test]
-    fn tcp_shutdown_simple() {
+    #[tokio::test]
+    async fn tcp_shutdown_simple() {
         let source_name = "tcp_shutdown_simple";
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, mut rx) = Pipeline::new_test();
         let addr = next_addr();
 
-        let mut shutdown = SourceShutdownCoordinator::new();
+        let mut shutdown = SourceShutdownCoordinator::default();
         let (shutdown_signal, _) = shutdown.register_source(source_name);
 
         // Start TCP Source
-        let server = SocketConfig::from(TcpConfig::new(addr.into()))
+        let server = SocketConfig::from(TcpConfig::from_address(addr.into()))
             .build(source_name, &GlobalOptions::default(), shutdown_signal, tx)
+            .await
             .unwrap();
-        let mut rt = runtime::Runtime::new().unwrap();
-        let source_handle = oneshot::spawn(server, &rt.executor());
-        wait_for_tcp(addr);
+        let source_handle = tokio::spawn(server);
 
         // Send data to Source.
-        rt.block_on(send_lines(addr, vec!["test".to_owned()].into_iter()))
+        wait_for_tcp(addr).await;
+        send_lines(addr, vec!["test".to_owned()].into_iter())
+            .await
             .unwrap();
 
-        let event = rx.wait().next().unwrap().unwrap();
-        assert_eq!(
-            event.as_log()[&event::log_schema().message_key()],
-            "test".into()
-        );
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.as_log()[log_schema().message_key()], "test".into());
 
         // Now signal to the Source to shut down.
         let deadline = Instant::now() + Duration::from_secs(10);
         let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
-        let shutdown_success = rt.block_on(shutdown_complete).unwrap();
+        let shutdown_success = shutdown_complete.await;
         assert_eq!(true, shutdown_success);
 
         // Ensure source actually shut down successfully.
-        rt.block_on(source_handle).unwrap();
+        let _ = source_handle.await.unwrap();
     }
 
-    #[test]
-    fn tcp_shutdown_infinite_stream() {
+    #[tokio::test]
+    async fn tcp_shutdown_infinite_stream() {
         // It's important that the buffer be large enough that the TCP source doesn't have
         // to block trying to forward its input into the Sender because the channel is full,
         // otherwise even sending the signal to shut down won't wake it up.
-        let (tx, rx) = mpsc::channel(10000);
+        let (tx, rx) = Pipeline::new_with_buffer(10_000, vec![]);
         let source_name = "tcp_shutdown_infinite_stream";
 
         let addr = next_addr();
-
-        let mut shutdown = SourceShutdownCoordinator::new();
+        let mut shutdown = SourceShutdownCoordinator::default();
         let (shutdown_signal, _) = shutdown.register_source(source_name);
 
         // Start TCP Source
-        let server = SocketConfig::from(TcpConfig {
-            shutdown_timeout_secs: 1,
-            ..TcpConfig::new(addr.into())
+        let server = SocketConfig::from({
+            let mut config = TcpConfig::from_address(addr.into());
+            config.set_shutdown_timeout_secs(1);
+            config
         })
         .build(source_name, &GlobalOptions::default(), shutdown_signal, tx)
+        .await
         .unwrap();
-        let mut rt = runtime::Runtime::new().unwrap();
-        let source_handle = oneshot::spawn(server, &rt.executor());
-        wait_for_tcp(addr);
+        let source_handle = tokio::spawn(server);
+
+        wait_for_tcp(addr).await;
+
+        let message = random_string(512);
+        let message_bytes = Bytes::from(message.clone() + "\n");
+
+        let cx = SinkContext::new_test();
+        let encode_event = move |_event| Some(message_bytes.clone());
+        let sink_config = TcpSinkConfig::from_address(format!("localhost:{}", addr.port()));
+        let (sink, _healthcheck) = sink_config.build(cx, encode_event).unwrap();
 
         // Spawn future that keeps sending lines to the TCP source forever.
-        let sink = TcpSink::new(
-            "localhost".to_owned(),
-            addr.port(),
-            Resolver::new(Vec::new(), rt.executor()).unwrap(),
-            MaybeTlsSettings::Raw(()),
-        );
-        rt.spawn(
-            stream::iter_ok::<_, ()>(std::iter::repeat(()))
-                .map(|_| Bytes::from("test\n"))
-                .map_err(|_| ())
-                .forward(sink)
-                .map(|_| ()),
-        );
+        tokio::spawn(async move {
+            let input = stream::repeat(())
+                .map(move |_| Event::new_empty_log())
+                .boxed();
+            sink.run(input).await.unwrap();
+        });
 
         // Important that 'rx' doesn't get dropped until the pump has finished sending items to it.
-        let (_rx, events) = rt.block_on(CollectN::new(rx, 100)).ok().unwrap();
+        let events = collect_n(rx, 100).await;
         assert_eq!(100, events.len());
         for event in events {
             assert_eq!(
-                event.as_log()[&event::log_schema().message_key()],
-                "test".into()
+                event.as_log()[log_schema().message_key()],
+                message.clone().into()
             );
         }
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
-        let shutdown_success = rt.block_on(shutdown_complete).unwrap();
+        let shutdown_success = shutdown_complete.await;
         assert_eq!(true, shutdown_success);
 
         // Ensure that the source has actually shut down.
-        rt.block_on(source_handle).unwrap();
-    }
-
-    #[test]
-    fn tcp_gracefull_shutdown() {
-        let n = 10000;
-        // It's important that the buffer be large enough that the TCP source doesn't have
-        // to block trying to forward its input into the Sender because the channel is full,
-        // otherwise even sending the signal to shut down won't wake it up.
-        let (tx, rx) = mpsc::channel(n);
-        let source_name = "tcp_gracefull_shutdown_0";
-
-        let addr = next_addr();
-
-        let mut shutdown = SourceShutdownCoordinator::new();
-        let (shutdown_signal, _) = shutdown.register_source(source_name);
-
-        // Start TCP Source
-        let server = SocketConfig::from(TcpConfig {
-            shutdown_timeout_secs: 10,
-            ..TcpConfig::new(addr.into())
-        })
-        .build(
-            source_name,
-            &GlobalOptions::default(),
-            shutdown_signal,
-            tx.clone(),
-        )
-        .unwrap();
-        let mut rt = runtime::Runtime::with_thread_count(4).unwrap();
-        let source_handle = oneshot::spawn(server, &rt.executor());
-        wait_for_tcp(addr);
-
-        // Spawn future that keeps sending n lines to the TCP source.
-        info!("Start sink");
-        let sink = TcpSink::new(
-            "localhost".to_owned(),
-            addr.port(),
-            Resolver::new(Vec::new(), rt.executor()).unwrap(),
-            MaybeTlsSettings::Raw(()),
-        );
-        rt.spawn(
-            stream::iter_ok::<_, ()>(0..n)
-                .map(|i| Bytes::from(format!("{}\n", i)))
-                .forward(sink)
-                .map(|_| ()),
-        );
-
-        // Important that 'rx' doesn't get dropped until the pump has finished sending items to it.
-        info!("Collect 100 events");
-        let (rx, events) = rt.block_on(CollectN::new(rx, 100)).ok().unwrap();
-        assert_eq!(100, events.len());
-        let mut count = 0;
-        for event in events {
-            assert_eq!(
-                event.as_log()[&event::log_schema().message_key()],
-                format!("{}", count).into()
-            );
-            count += 1;
-        }
-
-        info!("Shutdown first source");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
-        let shutdown_success = rt.block_on(shutdown_complete).unwrap();
-        assert_eq!(true, shutdown_success);
-
-        // Ensure that the source has actually shut down.
-        rt.block_on(source_handle).unwrap();
-
-        // Start second source
-        info!("Start second source");
-        let source_name = "tcp_gracefull_shutdown_1";
-        let (shutdown_signal, _tripwire) = shutdown.register_source(source_name);
-
-        // Start TCP Source
-        let server = SocketConfig::from(TcpConfig {
-            shutdown_timeout_secs: 10,
-            ..TcpConfig::new(addr.into())
-        })
-        .build(source_name, &GlobalOptions::default(), shutdown_signal, tx)
-        .unwrap();
-        let source_handle = oneshot::spawn(server, &rt.executor());
-
-        // Consume rest of the events
-        info!("Collect rest of the events");
-        let (_rx, _) = rt
-            .block_on(CollectN::new(
-                rx.map(move |event| {
-                    assert_eq!(
-                        event.as_log()[&event::log_schema().message_key()],
-                        format!("{}", count).into()
-                    );
-                    count += 1;
-                }),
-                n - count,
-            ))
-            .ok()
-            .unwrap();
-
-        info!("Shutdown second source");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
-        let shutdown_success = rt.block_on(shutdown_complete).unwrap();
-        assert_eq!(true, shutdown_success);
-
-        // Ensure that the source has actually shut down.
-        rt.block_on(source_handle).unwrap();
-
-        // Ensure that the sink has actually shut down.
-        assert!(rt.shutdown_on_idle().wait().is_ok());
+        let _ = source_handle.await.unwrap();
     }
 
     //////// UDP TESTS ////////
     fn send_lines_udp(addr: SocketAddr, lines: impl IntoIterator<Item = String>) -> SocketAddr {
         let bind = next_addr();
-
         let socket = UdpSocket::bind(bind)
-            .map_err(|e| panic!("{:}", e))
+            .map_err(|error| panic!("{:}", error))
             .ok()
             .unwrap();
 
@@ -526,7 +507,7 @@ mod test {
             assert_eq!(
                 socket
                     .send_to(line.as_bytes(), addr)
-                    .map_err(|e| panic!("{:}", e))
+                    .map_err(|error| panic!("{:}", error))
                     .ok()
                     .unwrap(),
                 line.as_bytes().len()
@@ -542,167 +523,159 @@ mod test {
         bind
     }
 
-    fn init_udp_with_shutdown(
-        sender: mpsc::Sender<event::Event>,
+    async fn init_udp_with_shutdown(
+        sender: Pipeline,
         source_name: &str,
         shutdown: &mut SourceShutdownCoordinator,
-    ) -> (SocketAddr, runtime::Runtime, oneshot::SpawnHandle<(), ()>) {
+    ) -> (SocketAddr, JoinHandle<Result<(), ()>>) {
         let (shutdown_signal, _) = shutdown.register_source(source_name);
-        init_udp_inner(sender, source_name, shutdown_signal)
+        init_udp_inner(sender, source_name, shutdown_signal).await
     }
 
-    fn init_udp(sender: mpsc::Sender<event::Event>) -> (SocketAddr, runtime::Runtime) {
-        let (addr, rt, handle) = init_udp_inner(sender, "default", ShutdownSignal::noop());
-        handle.forget();
-        return (addr, rt);
+    async fn init_udp(sender: Pipeline) -> SocketAddr {
+        let (addr, _handle) = init_udp_inner(sender, "default", ShutdownSignal::noop()).await;
+        addr
     }
 
-    fn init_udp_inner(
-        sender: mpsc::Sender<event::Event>,
+    async fn init_udp_inner(
+        sender: Pipeline,
         source_name: &str,
         shutdown_signal: ShutdownSignal,
-    ) -> (SocketAddr, runtime::Runtime, oneshot::SpawnHandle<(), ()>) {
-        let addr = next_addr();
+    ) -> (SocketAddr, JoinHandle<Result<(), ()>>) {
+        let address = next_addr();
 
-        let server = SocketConfig::from(UdpConfig::new(addr))
+        let server = SocketConfig::from(UdpConfig::from_address(address))
             .build(
                 source_name,
                 &GlobalOptions::default(),
                 shutdown_signal,
                 sender,
             )
+            .await
             .unwrap();
-        let rt = runtime::Runtime::new().unwrap();
-        let source_handle = oneshot::spawn(server, &rt.executor());
+        let source_handle = tokio::spawn(server);
 
-        // Wait for udp to start listening
-        thread::sleep(Duration::from_millis(100));
+        // Wait for UDP to start listening
+        tokio::time::delay_for(tokio::time::Duration::from_millis(100)).await;
 
-        (addr, rt, source_handle)
+        (address, source_handle)
     }
 
-    #[test]
-    fn udp_message() {
-        let (tx, rx) = mpsc::channel(2);
-
-        let (address, mut rt) = init_udp(tx);
+    #[tokio::test]
+    async fn udp_message() {
+        let (tx, rx) = Pipeline::new_test();
+        let address = init_udp(tx).await;
 
         send_lines_udp(address, vec!["test".to_string()]);
-        let events = rt.block_on(collect_n(rx, 1)).ok().unwrap();
+        let events = collect_n(rx, 1).await;
 
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
     }
 
-    #[test]
-    fn udp_multiple_messages() {
-        let (tx, rx) = mpsc::channel(10);
-
-        let (address, mut rt) = init_udp(tx);
+    #[tokio::test]
+    async fn udp_multiple_messages() {
+        let (tx, rx) = Pipeline::new_test();
+        let address = init_udp(tx).await;
 
         send_lines_udp(address, vec!["test\ntest2".to_string()]);
-        let events = rt.block_on(collect_n(rx, 2)).ok().unwrap();
+        let events = collect_n(rx, 2).await;
 
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
         assert_eq!(
-            events[1].as_log()[&event::log_schema().message_key()],
+            events[1].as_log()[log_schema().message_key()],
             "test2".into()
         );
     }
 
-    #[test]
-    fn udp_multiple_packets() {
-        let (tx, rx) = mpsc::channel(10);
-
-        let (address, mut rt) = init_udp(tx);
+    #[tokio::test]
+    async fn udp_multiple_packets() {
+        let (tx, rx) = Pipeline::new_test();
+        let address = init_udp(tx).await;
 
         send_lines_udp(address, vec!["test".to_string(), "test2".to_string()]);
-        let events = rt.block_on(collect_n(rx, 2)).ok().unwrap();
+        let events = collect_n(rx, 2).await;
 
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
         assert_eq!(
-            events[1].as_log()[&event::log_schema().message_key()],
+            events[1].as_log()[log_schema().message_key()],
             "test2".into()
         );
     }
 
-    #[test]
-    fn udp_it_includes_host() {
-        let (tx, rx) = mpsc::channel(2);
-
-        let (address, mut rt) = init_udp(tx);
+    #[tokio::test]
+    async fn udp_it_includes_host() {
+        let (tx, rx) = Pipeline::new_test();
+        let address = init_udp(tx).await;
 
         let from = send_lines_udp(address, vec!["test".to_string()]);
-        let events = rt.block_on(collect_n(rx, 1)).ok().unwrap();
+        let events = collect_n(rx, 1).await;
 
         assert_eq!(
-            events[0].as_log()[&event::log_schema().host_key()],
+            events[0].as_log()[log_schema().host_key()],
             format!("{}", from).into()
         );
     }
 
-    #[test]
-    fn udp_it_includes_source_type() {
-        let (tx, rx) = mpsc::channel(2);
-
-        let (address, mut rt) = init_udp(tx);
+    #[tokio::test]
+    async fn udp_it_includes_source_type() {
+        let (tx, rx) = Pipeline::new_test();
+        let address = init_udp(tx).await;
 
         let _ = send_lines_udp(address, vec!["test".to_string()]);
-        let events = rt.block_on(collect_n(rx, 1)).ok().unwrap();
+        let events = collect_n(rx, 1).await;
 
         assert_eq!(
-            events[0].as_log()[event::log_schema().source_type_key()],
+            events[0].as_log()[log_schema().source_type_key()],
             "socket".into()
         );
     }
 
-    #[test]
-    fn udp_shutdown_simple() {
-        let (tx, rx) = mpsc::channel(2);
+    #[tokio::test]
+    async fn udp_shutdown_simple() {
+        let (tx, rx) = Pipeline::new_test();
         let source_name = "udp_shutdown_simple";
 
-        let mut shutdown = SourceShutdownCoordinator::new();
-        let (address, mut rt, source_handle) =
-            init_udp_with_shutdown(tx, source_name, &mut shutdown);
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let (address, source_handle) = init_udp_with_shutdown(tx, source_name, &mut shutdown).await;
 
         send_lines_udp(address, vec!["test".to_string()]);
-        let events = rt.block_on(collect_n(rx, 1)).ok().unwrap();
+        let events = collect_n(rx, 1).await;
 
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
 
         // Now signal to the Source to shut down.
         let deadline = Instant::now() + Duration::from_secs(10);
         let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
-        let shutdown_success = rt.block_on(shutdown_complete).unwrap();
+        let shutdown_success = shutdown_complete.await;
         assert_eq!(true, shutdown_success);
 
         // Ensure source actually shut down successfully.
-        rt.block_on(source_handle).unwrap();
+        let _ = source_handle.await.unwrap();
     }
 
-    #[test]
-    fn udp_shutdown_infinite_stream() {
-        let (tx, rx) = mpsc::channel(10);
+    #[tokio::test]
+    async fn udp_shutdown_infinite_stream() {
+        let (tx, rx) = Pipeline::new_test();
         let source_name = "udp_shutdown_infinite_stream";
 
-        let mut shutdown = SourceShutdownCoordinator::new();
-        let (address, mut rt, source_handle) =
-            init_udp_with_shutdown(tx, source_name, &mut shutdown);
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let (address, source_handle) = init_udp_with_shutdown(tx, source_name, &mut shutdown).await;
 
         // Stream that keeps sending lines to the UDP source forever.
         let run_pump_atomic_sender = Arc::new(AtomicBool::new(true));
-        let run_pump_atomic_receiver = run_pump_atomic_sender.clone();
+        let run_pump_atomic_receiver = Arc::clone(&run_pump_atomic_sender);
         let pump_handle = std::thread::spawn(move || {
             send_lines_udp(
                 address,
@@ -712,137 +685,218 @@ mod test {
         });
 
         // Important that 'rx' doesn't get dropped until the pump has finished sending items to it.
-        let (_rx, events) = rt.block_on(CollectN::new(rx, 100)).ok().unwrap();
+        let events = collect_n(rx, 100).await;
         assert_eq!(100, events.len());
         for event in events {
-            assert_eq!(
-                event.as_log()[&event::log_schema().message_key()],
-                "test".into()
-            );
+            assert_eq!(event.as_log()[log_schema().message_key()], "test".into());
         }
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
-        let shutdown_success = rt.block_on(shutdown_complete).unwrap();
+        let shutdown_success = shutdown_complete.await;
         assert_eq!(true, shutdown_success);
 
         // Ensure that the source has actually shut down.
-        rt.block_on(source_handle).unwrap();
+        let _ = source_handle.await.unwrap();
 
         // Stop the pump from sending lines forever.
         run_pump_atomic_sender.store(false, Ordering::Relaxed);
         assert!(pump_handle.join().is_ok());
     }
 
-    ////////////// UNIX TESTS //////////////
+    ////////////// UNIX TEST LIBS //////////////
     #[cfg(unix)]
-    fn init_unix(sender: mpsc::Sender<event::Event>) -> (PathBuf, runtime::Runtime) {
+    async fn init_unix(sender: Pipeline, stream: bool) -> PathBuf {
         let in_path = tempfile::tempdir().unwrap().into_path().join("unix_test");
 
-        let server = SocketConfig::from(UnixConfig::new(in_path.clone()))
+        let config = UnixConfig::new(in_path.clone());
+        let mode = if stream {
+            Mode::UnixStream(config)
+        } else {
+            Mode::UnixDatagram(config)
+        };
+        let server = SocketConfig { mode }
             .build(
                 "default",
                 &GlobalOptions::default(),
                 ShutdownSignal::noop(),
                 sender,
             )
+            .await
             .unwrap();
-
-        let mut rt = runtime::Runtime::new().unwrap();
-        rt.spawn(server);
+        tokio::spawn(server);
 
         // Wait for server to accept traffic
-        while let Err(_) = std::os::unix::net::UnixStream::connect(&in_path) {}
+        while if stream {
+            std::os::unix::net::UnixStream::connect(&in_path).is_err()
+        } else {
+            let socket = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            socket.connect(&in_path).is_err()
+        } {
+            yield_now().await;
+        }
 
-        (in_path, rt)
+        in_path
     }
 
     #[cfg(unix)]
-    fn send_lines_unix<'a>(path: PathBuf, lines: Vec<&'a str>) {
-        let input_stream =
-            futures01::stream::iter_ok::<_, ()>(lines.clone().into_iter().map(|s| s.to_string()));
-
-        UnixStream::connect(&path)
-            .map_err(|e| panic!("{:}", e))
-            .and_then(|socket| {
-                let out =
-                    FramedWrite::new(socket, LinesCodec::new()).sink_map_err(|e| panic!("{:?}", e));
-
-                input_stream
-                    .forward(out)
-                    .map(|(_source, sink)| sink)
-                    .and_then(|sink| {
-                        let socket = sink.into_inner().into_inner();
-                        tokio01::io::shutdown(socket)
-                            .map(|_| ())
-                            .map_err(|e| panic!("{:}", e))
-                    })
-            })
-            .wait()
-            .unwrap();
+    async fn unix_send_lines(stream: bool, path: PathBuf, lines: &[&str]) {
+        match stream {
+            false => send_lines_unix_datagram(path, lines).await,
+            true => send_lines_unix_stream(path, lines).await,
+        }
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unix_message() {
-        let (tx, rx) = mpsc::channel(2);
+    async fn unix_message(stream: bool) {
+        let (tx, rx) = Pipeline::new_test();
+        let path = init_unix(tx, stream).await;
 
-        let (path, mut rt) = init_unix(tx);
+        unix_send_lines(stream, path, &["test"]).await;
 
-        send_lines_unix(path, vec!["test"]);
-
-        let events = rt.block_on(collect_n(rx, 1)).ok().unwrap();
+        let events = collect_n(rx, 1).await;
 
         assert_eq!(1, events.len());
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
         assert_eq!(
-            events[0].as_log()[event::log_schema().source_type_key()],
+            events[0].as_log()[log_schema().source_type_key()],
             "socket".into()
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unix_multiple_messages() {
-        let (tx, rx) = mpsc::channel(10);
+    async fn unix_multiple_messages(stream: bool) {
+        let (tx, rx) = Pipeline::new_test();
+        let path = init_unix(tx, stream).await;
 
-        let (path, mut rt) = init_unix(tx);
-
-        send_lines_unix(path, vec!["test\ntest2"]);
-        let events = rt.block_on(collect_n(rx, 2)).ok().unwrap();
+        unix_send_lines(stream, path, &["test\ntest2"]).await;
+        let events = collect_n(rx, 2).await;
 
         assert_eq!(2, events.len());
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
         assert_eq!(
-            events[1].as_log()[&event::log_schema().message_key()],
+            events[1].as_log()[log_schema().message_key()],
             "test2".into()
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unix_multiple_packets() {
-        let (tx, rx) = mpsc::channel(10);
+    async fn unix_multiple_packets(stream: bool) {
+        let (tx, rx) = Pipeline::new_test();
+        let path = init_unix(tx, stream).await;
 
-        let (path, mut rt) = init_unix(tx);
-
-        send_lines_unix(path, vec!["test", "test2"]);
-        let events = rt.block_on(collect_n(rx, 2)).ok().unwrap();
+        unix_send_lines(stream, path, &["test", "test2"]).await;
+        let events = collect_n(rx, 2).await;
 
         assert_eq!(2, events.len());
         assert_eq!(
-            events[0].as_log()[&event::log_schema().message_key()],
+            events[0].as_log()[log_schema().message_key()],
             "test".into()
         );
         assert_eq!(
-            events[1].as_log()[&event::log_schema().message_key()],
+            events[1].as_log()[log_schema().message_key()],
             "test2".into()
         );
+    }
+
+    #[cfg(unix)]
+    fn parses_unix_config(name: &str) -> SocketConfig {
+        toml::from_str::<SocketConfig>(&format!(
+            r#"
+               mode = "{}"
+               path = "/does/not/exist"
+            "#,
+            name
+        ))
+        .unwrap()
+    }
+
+    ////////////// UNIX DATAGRAM TESTS //////////////
+    #[cfg(unix)]
+    async fn send_lines_unix_datagram(path: PathBuf, lines: &[&str]) {
+        let mut socket = UnixDatagram::unbound().unwrap();
+        socket.connect(path).unwrap();
+
+        for line in lines {
+            socket.send(format!("{}\n", line).as_bytes()).await.unwrap();
+        }
+        socket.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_datagram_message() {
+        unix_message(false).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_datagram_multiple_messages() {
+        unix_multiple_messages(false).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_datagram_multiple_packets() {
+        unix_multiple_packets(false).await
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_unix_datagram_config() {
+        let config = parses_unix_config("unix_datagram");
+        assert!(matches!(config.mode,Mode::UnixDatagram { .. }));
+    }
+
+    ////////////// UNIX STREAM TESTS //////////////
+    #[cfg(unix)]
+    async fn send_lines_unix_stream(path: PathBuf, lines: &[&str]) {
+        let socket = UnixStream::connect(path).await.unwrap();
+        let mut sink = FramedWrite::new(socket, LinesCodec::new());
+
+        let lines = lines.iter().map(|s| Ok(s.to_string()));
+        let lines = lines.collect::<Vec<_>>();
+        sink.send_all(&mut stream::iter(lines)).await.unwrap();
+
+        let socket = sink.into_inner();
+        socket.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stream_message() {
+        unix_message(true).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stream_multiple_messages() {
+        unix_multiple_messages(true).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stream_multiple_packets() {
+        unix_multiple_packets(true).await
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_new_unix_stream_config() {
+        let config = parses_unix_config("unix_stream");
+        assert!(matches!(config.mode,Mode::UnixStream { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_old_unix_stream_config() {
+        let config = parses_unix_config("unix");
+        assert!(matches!(config.mode,Mode::UnixStream { .. }));
     }
 }

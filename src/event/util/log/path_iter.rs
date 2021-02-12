@@ -52,10 +52,7 @@ enum PathIterState<'a> {
 
 impl PathIterState<'_> {
     fn is_start(&self) -> bool {
-        match self {
-            Self::Start => true,
-            _ => false,
-        }
+        matches!(self, Self::Start)
     }
 }
 
@@ -90,17 +87,17 @@ impl<'a> Iterator for PathIter<'a> {
                 },
                 Key(mut s) => match c {
                     Some('.') => {
-                        res = Some(Some(PathComponent::Key(s.into())));
+                        res = Some(Some(PathComponent::Key(s)));
                         Dot
                     }
                     Some('[') => {
-                        res = Some(Some(PathComponent::Key(s.into())));
+                        res = Some(Some(PathComponent::Key(s)));
                         OpeningBracket
                     }
                     Some(']') => Invalid,
                     Some('\\') => KeyEscape(s),
                     None => {
-                        res = Some(Some(PathComponent::Key(s.into())));
+                        res = Some(Some(PathComponent::Key(s)));
                         End
                     }
                     Some(c) => {
@@ -116,7 +113,9 @@ impl<'a> Iterator for PathIter<'a> {
                     _ => Invalid,
                 },
                 Index(i) => match c {
-                    Some(c) if c >= '0' && c <= '9' => Index(10 * i + (c as usize - '0' as usize)),
+                    Some(c) if ('0'..='9').contains(&c) => {
+                        Index(10 * i + (c as usize - '0' as usize))
+                    }
                     Some(']') => {
                         res = Some(Some(PathComponent::Index(i)));
                         ClosingBracket
@@ -129,7 +128,7 @@ impl<'a> Iterator for PathIter<'a> {
                     Some(c) => Key(c.to_string()),
                 },
                 OpeningBracket => match c {
-                    Some(c) if c >= '0' && c <= '9' => Index(c as usize - '0' as usize),
+                    Some(c) if ('0'..='9').contains(&c) => Index(c as usize - '0' as usize),
                     _ => Invalid,
                 },
                 ClosingBracket => match c {

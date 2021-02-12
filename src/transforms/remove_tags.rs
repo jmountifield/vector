@@ -1,29 +1,36 @@
-use super::Transform;
 use crate::{
-    topology::config::{DataType, TransformConfig, TransformContext, TransformDescription},
+    config::{DataType, GenerateConfig, TransformConfig, TransformDescription},
+    transforms::{FunctionTransform, Transform},
     Event,
 };
 use serde::{Deserialize, Serialize};
-use string_cache::DefaultAtom as Atom;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RemoveTagsConfig {
-    pub tags: Vec<Atom>,
+    pub tags: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct RemoveTags {
-    tags: Vec<Atom>,
+    tags: Vec<String>,
 }
 
 inventory::submit! {
-    TransformDescription::new_without_default::<RemoveTagsConfig>("remove_tags")
+    TransformDescription::new::<RemoveTagsConfig>("remove_tags")
 }
 
+impl GenerateConfig for RemoveTagsConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(Self { tags: Vec::new() }).unwrap()
+    }
+}
+
+#[async_trait::async_trait]
 #[typetag::serde(name = "remove_tags")]
 impl TransformConfig for RemoveTagsConfig {
-    fn build(&self, _cx: TransformContext) -> crate::Result<Box<dyn Transform>> {
-        Ok(Box::new(RemoveTags::new(self.tags.clone())))
+    async fn build(&self) -> crate::Result<Transform> {
+        Ok(Transform::function(RemoveTags::new(self.tags.clone())))
     }
 
     fn input_type(&self) -> DataType {
@@ -40,18 +47,18 @@ impl TransformConfig for RemoveTagsConfig {
 }
 
 impl RemoveTags {
-    pub fn new(tags: Vec<Atom>) -> Self {
+    pub fn new(tags: Vec<String>) -> Self {
         RemoveTags { tags }
     }
 }
 
-impl Transform for RemoveTags {
-    fn transform(&mut self, mut event: Event) -> Option<Event> {
-        let ref mut tags = event.as_mut_metric().tags;
+impl FunctionTransform for RemoveTags {
+    fn transform(&mut self, output: &mut Vec<Event>, mut event: Event) {
+        let tags = &mut event.as_mut_metric().series.tags;
 
         if let Some(map) = tags {
             for tag in &self.tags {
-                map.remove(tag.as_ref());
+                map.remove(tag);
 
                 if map.is_empty() {
                     *tags = None;
@@ -60,25 +67,32 @@ impl Transform for RemoveTags {
             }
         }
 
-        Some(event)
+        output.push(event);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RemoveTags;
+    use super::*;
     use crate::{
         event::metric::{Metric, MetricKind, MetricValue},
         event::Event,
-        transforms::Transform,
     };
 
     #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<RemoveTagsConfig>();
+    }
+
+    #[test]
     fn remove_tags() {
-        let event = Event::Metric(Metric {
-            name: "foo".into(),
-            timestamp: None,
-            tags: Some(
+        let event = Event::Metric(
+            Metric::new(
+                "foo",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 10.0 },
+            )
+            .with_tags(Some(
                 vec![
                     ("env".to_owned(), "production".to_owned()),
                     ("region".to_owned(), "us-east-1".to_owned()),
@@ -86,14 +100,12 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-            ),
-            kind: MetricKind::Incremental,
-            value: MetricValue::Counter { value: 10.0 },
-        });
+            )),
+        );
 
         let mut transform = RemoveTags::new(vec!["region".into(), "host".into()]);
-        let metric = transform.transform(event).unwrap().into_metric();
-        let tags = metric.tags.unwrap();
+        let metric = transform.transform_one(event).unwrap().into_metric();
+        let tags = metric.tags().unwrap();
 
         assert_eq!(tags.len(), 1);
         assert!(tags.contains_key("env"));
@@ -103,39 +115,38 @@ mod tests {
 
     #[test]
     fn remove_all_tags() {
-        let event = Event::Metric(Metric {
-            name: "foo".into(),
-            timestamp: None,
-            tags: Some(
+        let event = Event::Metric(
+            Metric::new(
+                "foo",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 10.0 },
+            )
+            .with_tags(Some(
                 vec![("env".to_owned(), "production".to_owned())]
                     .into_iter()
                     .collect(),
-            ),
-            kind: MetricKind::Incremental,
-            value: MetricValue::Counter { value: 10.0 },
-        });
+            )),
+        );
 
         let mut transform = RemoveTags::new(vec!["env".into()]);
-        let metric = transform.transform(event).unwrap().into_metric();
+        let metric = transform.transform_one(event).unwrap().into_metric();
 
-        assert!(metric.tags.is_none());
+        assert!(metric.tags().is_none());
     }
 
     #[test]
     fn remove_tags_from_none() {
-        let event = Event::Metric(Metric {
-            name: "foo".into(),
-            timestamp: None,
-            tags: None,
-            kind: MetricKind::Incremental,
-            value: MetricValue::Set {
+        let event = Event::Metric(Metric::new(
+            "foo",
+            MetricKind::Incremental,
+            MetricValue::Set {
                 values: vec!["bar".into()].into_iter().collect(),
             },
-        });
+        ));
 
         let mut transform = RemoveTags::new(vec!["env".into()]);
-        let metric = transform.transform(event).unwrap().into_metric();
+        let metric = transform.transform_one(event).unwrap().into_metric();
 
-        assert!(metric.tags.is_none());
+        assert!(metric.tags().is_none());
     }
 }

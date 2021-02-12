@@ -1,5 +1,6 @@
 use crate::{
     event::{PathComponent, PathIter},
+    serde::skip_serializing_if_default,
     sinks::util::encoding::{
         with_default::EncodingConfigWithDefault, EncodingConfiguration, TimestampFormat,
     },
@@ -12,7 +13,6 @@ use std::{
     fmt::{self, Debug},
     marker::PhantomData,
 };
-use string_cache::DefaultAtom as Atom;
 
 /// A structure to wrap sink encodings and enforce field privacy.
 ///
@@ -22,12 +22,14 @@ use string_cache::DefaultAtom as Atom;
 #[serde(deny_unknown_fields)]
 pub struct EncodingConfig<E> {
     pub(crate) codec: E,
+    #[serde(default, skip_serializing_if = "skip_serializing_if_default")]
+    pub(crate) schema: Option<String>,
     // TODO(2410): Using PathComponents here is a hack for #2407, #2410 should fix this fully.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "skip_serializing_if_default")]
     pub(crate) only_fields: Option<Vec<Vec<PathComponent>>>,
-    #[serde(default)]
-    pub(crate) except_fields: Option<Vec<Atom>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "skip_serializing_if_default")]
+    pub(crate) except_fields: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "skip_serializing_if_default")]
     pub(crate) timestamp_format: Option<TimestampFormat>,
 }
 
@@ -35,11 +37,14 @@ impl<E> EncodingConfiguration<E> for EncodingConfig<E> {
     fn codec(&self) -> &E {
         &self.codec
     }
+    fn schema(&self) -> &Option<String> {
+        &self.schema
+    }
     // TODO(2410): Using PathComponents here is a hack for #2407, #2410 should fix this fully.
     fn only_fields(&self) -> &Option<Vec<Vec<PathComponent>>> {
         &self.only_fields
     }
-    fn except_fields(&self) -> &Option<Vec<Atom>> {
+    fn except_fields(&self) -> &Option<Vec<String>> {
         &self.except_fields
     }
     fn timestamp_format(&self) -> &Option<TimestampFormat> {
@@ -47,13 +52,30 @@ impl<E> EncodingConfiguration<E> for EncodingConfig<E> {
     }
 }
 
-impl<E> Into<EncodingConfigWithDefault<E>> for EncodingConfig<E>
+impl<E> From<EncodingConfigWithDefault<E>> for EncodingConfig<E>
 where
     E: Default + PartialEq,
 {
-    fn into(self) -> EncodingConfigWithDefault<E> {
-        EncodingConfigWithDefault {
-            codec: self.codec,
+    fn from(encoding: EncodingConfigWithDefault<E>) -> Self {
+        Self {
+            codec: encoding.codec,
+            schema: encoding.schema,
+            only_fields: encoding.only_fields,
+            except_fields: encoding.except_fields,
+            timestamp_format: encoding.timestamp_format,
+        }
+    }
+}
+
+#[cfg(any(feature = "sinks-new_relic_logs", feature = "sinks-humio"))]
+impl<E> EncodingConfig<E> {
+    pub(crate) fn into_encoding<X>(self) -> EncodingConfig<X>
+    where
+        X: From<E>,
+    {
+        EncodingConfig {
+            codec: self.codec.into(),
+            schema: self.schema,
             only_fields: self.only_fields,
             except_fields: self.except_fields,
             timestamp_format: self.timestamp_format,
@@ -65,6 +87,7 @@ impl<E> From<E> for EncodingConfig<E> {
     fn from(codec: E) -> Self {
         Self {
             codec,
+            schema: Default::default(),
             only_fields: Default::default(),
             except_fields: Default::default(),
             timestamp_format: Default::default(),
@@ -105,6 +128,7 @@ where
             {
                 Ok(Self::Value {
                     codec: T::deserialize(value.into_deserializer())?,
+                    schema: Default::default(),
                     only_fields: Default::default(),
                     except_fields: Default::default(),
                     timestamp_format: Default::default(),
@@ -127,6 +151,7 @@ where
 
         let concrete = Self {
             codec: inner.codec,
+            schema: inner.schema,
             // TODO(2410): Using PathComponents here is a hack for #2407, #2410 should fix this fully.
             only_fields: inner.only_fields.map(|fields| {
                 fields
@@ -138,9 +163,7 @@ where
             timestamp_format: inner.timestamp_format,
         };
 
-        concrete
-            .validate()
-            .map_err(|e| serde::de::Error::custom(e))?;
+        concrete.validate().map_err(serde::de::Error::custom)?;
         Ok(concrete)
     }
 }
@@ -149,9 +172,11 @@ where
 pub struct Inner<E> {
     codec: E,
     #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
     only_fields: Option<Vec<String>>,
     #[serde(default)]
-    except_fields: Option<Vec<Atom>>,
+    except_fields: Option<Vec<String>>,
     #[serde(default)]
     timestamp_format: Option<TimestampFormat>,
 }

@@ -14,6 +14,8 @@ inventory::submit! {
     ConditionDescription::new::<IsMetricConfig>("is_metric")
 }
 
+impl_generate_config_from_default!(IsMetricConfig);
+
 #[typetag::serde(name = "is_metric")]
 impl ConditionConfig for IsMetricConfig {
     fn build(&self) -> crate::Result<Box<dyn Condition>> {
@@ -23,14 +25,12 @@ impl ConditionConfig for IsMetricConfig {
 
 //------------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct IsMetric {}
 
 impl Condition for IsMetric {
     fn check(&self, e: &Event) -> bool {
-        match e {
-            Event::Metric(_) => true,
-            _ => false,
-        }
+        matches!(e, Event::Metric(_))
     }
 
     fn check_with_context(&self, e: &Event) -> Result<(), String> {
@@ -53,18 +53,21 @@ mod test {
     };
 
     #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<IsMetricConfig>();
+    }
+
+    #[test]
     fn is_metric_basic() {
         let cond = IsMetricConfig {}.build().unwrap();
 
         assert_eq!(cond.check(&Event::from("just a log")), false);
         assert_eq!(
-            cond.check(&Event::from(Metric {
-                name: "test metric".to_string(),
-                timestamp: None,
-                tags: None,
-                kind: MetricKind::Incremental,
-                value: MetricValue::Counter { value: 1.0 },
-            })),
+            cond.check(&Event::from(Metric::new(
+                "test metric",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 1.0 },
+            ))),
             true
         );
     }

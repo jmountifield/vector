@@ -1,27 +1,44 @@
 use crate::{
+    config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
     event::proto,
-    internal_events::VectorEventSent,
-    sinks::util::{tcp::TcpSink, StreamSink},
-    tls::{MaybeTlsSettings, TlsConfig},
-    topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+    sinks::util::tcp::TcpSinkConfig,
+    tcp::TcpKeepaliveConfig,
+    tls::TlsConfig,
     Event,
 };
 use bytes::{BufMut, Bytes, BytesMut};
-use futures01::{stream::iter_ok, Sink};
+use getset::Setters;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Setters)]
 #[serde(deny_unknown_fields)]
 pub struct VectorSinkConfig {
-    pub address: String,
-    pub tls: Option<TlsConfig>,
+    address: String,
+    keepalive: Option<TcpKeepaliveConfig>,
+    #[set = "pub"]
+    tls: Option<TlsConfig>,
+    send_buffer_bytes: Option<usize>,
 }
 
 impl VectorSinkConfig {
-    pub fn new(address: String) -> Self {
-        Self { address, tls: None }
+    pub fn new(
+        address: String,
+        keepalive: Option<TcpKeepaliveConfig>,
+        tls: Option<TlsConfig>,
+        send_buffer_bytes: Option<usize>,
+    ) -> Self {
+        Self {
+            address,
+            keepalive,
+            tls,
+            send_buffer_bytes,
+        }
+    }
+
+    pub fn from_address(address: String) -> Self {
+        Self::new(address, None, None, None)
     }
 }
 
@@ -34,25 +51,30 @@ enum BuildError {
 }
 
 inventory::submit! {
-    SinkDescription::new_without_default::<VectorSinkConfig>("vector")
+    SinkDescription::new::<VectorSinkConfig>("vector")
 }
 
+impl GenerateConfig for VectorSinkConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(Self::new("127.0.0.1:5000".to_string(), None, None, None)).unwrap()
+    }
+}
+
+#[async_trait::async_trait]
 #[typetag::serde(name = "vector")]
 impl SinkConfig for VectorSinkConfig {
-    fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
-        let uri = self.address.parse::<http::Uri>()?;
+    async fn build(
+        &self,
+        cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
+        let sink_config = TcpSinkConfig::new(
+            self.address.clone(),
+            self.keepalive,
+            self.tls.clone(),
+            self.send_buffer_bytes,
+        );
 
-        let host = uri.host().ok_or(BuildError::MissingHost)?.to_string();
-        let port = uri.port_u16().ok_or(BuildError::MissingPort)?;
-
-        let tls = MaybeTlsSettings::from_config(&self.tls, false)?;
-
-        let sink = TcpSink::new(host.clone(), port, cx.resolver(), tls);
-        let sink = StreamSink::new(sink, cx.acker())
-            .with_flat_map(move |event| iter_ok(encode_event(event)));
-        let healthcheck = super::util::tcp::tcp_healthcheck(host, port, cx.resolver());
-
-        Ok((Box::new(sink), healthcheck))
+        sink_config.build(cx, encode_event)
     }
 
     fn input_type(&self) -> DataType {
@@ -75,12 +97,17 @@ fn encode_event(event: Event) -> Option<Bytes> {
     let event_len = event.encoded_len();
     let full_len = event_len + 4;
 
-    emit!(VectorEventSent {
-        byte_size: full_len
-    });
-
     let mut out = BytesMut::with_capacity(full_len);
-    out.put_u32_be(event_len as u32);
+    out.put_u32(event_len as u32);
     event.encode(&mut out).unwrap();
-    Some(out.freeze())
+
+    Some(out.into())
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<super::VectorSinkConfig>();
+    }
 }

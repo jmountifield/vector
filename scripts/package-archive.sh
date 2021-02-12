@@ -7,7 +7,7 @@ set -euo pipefail
 #
 #   Used to package a tar.gz archive for the specified $TARGET. This assumes
 #   that the binary is already built and in the proper $TARGET dir. See
-#   buid.sh for more info.
+#   build.sh for more info.
 #
 # ENV VARS
 #
@@ -24,6 +24,8 @@ OVERWRITE=${OVERWRITE:-"true"}
 ARCHIVE_TYPE="${ARCHIVE_TYPE:-"tar.gz"}"
 NATIVE_BUILD="${NATIVE_BUILD:-"true"}"
 TARGET="${TARGET:?"You must specify a target triple, ex: x86_64-apple-darwin"}"
+PROJECT_ROOT="$(pwd)"
+ARCHIVE_VERSION="${VECTOR_VERSION:-"$("$PROJECT_ROOT"/scripts/version.sh)"}"
 
 #
 # Local Vars
@@ -37,7 +39,7 @@ fi
 
 ARCHIVE_DIR_NAME="vector-$TARGET"
 ARCHIVE_DIR="$TARGET_DIR/$ARCHIVE_DIR_NAME"
-ARCHIVE_NAME="vector-$TARGET.$ARCHIVE_TYPE"
+ARCHIVE_NAME="vector-$ARCHIVE_VERSION-$TARGET.$ARCHIVE_TYPE"
 ARTIFACTS_DIR="target/artifacts"
 
 #
@@ -95,9 +97,6 @@ cp -av "$TARGET_DIR/release/vector" "$ARCHIVE_DIR/bin"
 
 cp -rv config "$ARCHIVE_DIR/config"
 
-# Remove templates sources
-rm "$ARCHIVE_DIR/config"/*.erb
-
 # Copy /etc useful files
 
 if [[ $TARGET == *linux* ]]; then
@@ -117,7 +116,7 @@ fi
     tar cvf - "./$ARCHIVE_DIR_NAME" | gzip -9 > "$ARCHIVE_NAME"
   elif [ "$ARCHIVE_TYPE" == "zip" ] && [[ $TARGET == *windows* ]]; then
     # shellcheck disable=SC2016
-    powershell '$progressPreference = "silentlyContinue"; Compress-Archive -DestinationPath vector-'"$TARGET"'.'"$ARCHIVE_TYPE"' -Path "./'"$ARCHIVE_DIR_NAME"'/*"'
+    powershell '$progressPreference = "silentlyContinue"; Compress-Archive -DestinationPath vector-'"$ARCHIVE_VERSION"'-'"$TARGET"'.'"$ARCHIVE_TYPE"' -Path "./'"$ARCHIVE_DIR_NAME"'/*"'
   else
     echo "Unsupported combination of ARCHIVE_TYPE and TARGET"
     exit 1

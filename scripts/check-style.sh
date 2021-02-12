@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # check-style.sh
@@ -25,16 +25,23 @@ ised() {
 
 EXIT_CODE=0
 for FILE in $(git ls-files); do
-  # ignore binary files
+  # Ignore binary files and generated files.
   case "$FILE" in
     *png) continue;;
     *svg) continue;;
+    *gif) continue;;
     *ico) continue;;
     *sig) continue;;
     tests/data*) continue;;
-    website/plugins/*) continue;;
-    website/sidebars.js) continue;;
+    distribution/kubernetes/*/*.yaml) continue;;
+    tests/helm-snapshots/*/snapshot.yaml) continue;;
+    lib/remap-tests/tests/*.vrl) continue;;
   esac
+
+  # Skip all directories (usually theis only happens when we have symlinks).
+  if [[ -d "$FILE" ]]; then
+    continue
+  fi
 
   # check that the file contains trailing newline
   if [ -n "$(tail -c1 "$FILE" | tr -d $'\n')" ]; then

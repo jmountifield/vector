@@ -1,16 +1,26 @@
-use crate::Event;
-use futures01::{sync::mpsc, task::AtomicTask, AsyncSink, Poll, Sink, StartSend, Stream};
+use crate::{config::Resource, Event};
+#[cfg(feature = "leveldb")]
+use futures::compat::{Sink01CompatExt, Stream01CompatExt};
+use futures::{channel::mpsc, Sink, SinkExt, Stream};
+use futures01::task::AtomicTask;
+use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
 };
+#[cfg(feature = "leveldb")]
+use tokio::stream::StreamExt;
 
 #[cfg(feature = "leveldb")]
 pub mod disk;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum BufferConfig {
@@ -50,6 +60,7 @@ impl Default for WhenFull {
     }
 }
 
+#[derive(Clone)]
 pub enum BufferInputCloner {
     Memory(mpsc::Sender<Event>, WhenFull),
     #[cfg(feature = "leveldb")]
@@ -57,12 +68,14 @@ pub enum BufferInputCloner {
 }
 
 impl BufferInputCloner {
-    pub fn get(&self) -> Box<dyn Sink<SinkItem = Event, SinkError = ()> + Send> {
+    pub fn get(&self) -> Box<dyn Sink<Event, Error = ()> + Send> {
         match self {
             BufferInputCloner::Memory(tx, when_full) => {
-                let inner = tx.clone().sink_map_err(|e| error!("sender error: {:?}", e));
+                let inner = tx
+                    .clone()
+                    .sink_map_err(|error| error!(message = "Sender error.", %error));
                 if when_full == &WhenFull::DropNewest {
-                    Box::new(DropWhenFull { inner })
+                    Box::new(DropWhenFull::new(inner))
                 } else {
                     Box::new(inner)
                 }
@@ -70,12 +83,11 @@ impl BufferInputCloner {
 
             #[cfg(feature = "leveldb")]
             BufferInputCloner::Disk(writer, when_full) => {
+                let inner = writer.clone().sink_compat();
                 if when_full == &WhenFull::DropNewest {
-                    Box::new(DropWhenFull {
-                        inner: writer.clone(),
-                    })
+                    Box::new(DropWhenFull::new(inner))
                 } else {
-                    Box::new(writer.clone())
+                    Box::new(inner)
                 }
             }
         }
@@ -96,7 +108,7 @@ impl BufferConfig {
     ) -> Result<
         (
             BufferInputCloner,
-            Box<dyn Stream<Item = Event, Error = ()> + Send>,
+            Box<dyn Stream<Item = Event> + Send>,
             Acker,
         ),
         String,
@@ -123,11 +135,25 @@ impl BufferConfig {
                 let buffer_dir = format!("{}_buffer", sink_name);
 
                 let (tx, rx, acker) = disk::open(&data_dir, buffer_dir.as_ref(), *max_size)
-                    .map_err(|err| err.to_string())?;
+                    .map_err(|error| error.to_string())?;
                 let tx = BufferInputCloner::Disk(tx, *when_full);
-                let rx = Box::new(rx);
+                let rx = Box::new(
+                    rx.compat()
+                        .take_while(|event| event.is_ok())
+                        .map(|event| event.unwrap()),
+                );
                 Ok((tx, rx, acker))
             }
+        }
+    }
+
+    /// Resources that the sink is using.
+    #[cfg_attr(not(feature = "leveldb"), allow(unused))]
+    pub fn resources(&self, sink_name: &str) -> Vec<Resource> {
+        match self {
+            BufferConfig::Memory { .. } => Vec::new(),
+            #[cfg(feature = "leveldb")]
+            BufferConfig::Disk { .. } => vec![Resource::DiskBuffer(sink_name.to_string())],
         }
     }
 }
@@ -167,67 +193,102 @@ impl Acker {
     }
 }
 
+#[pin_project]
 pub struct DropWhenFull<S> {
+    #[pin]
     inner: S,
+    drop: bool,
 }
 
-impl<S: Sink> Sink for DropWhenFull<S> {
-    type SinkItem = S::SinkItem;
-    type SinkError = S::SinkError;
+impl<S> DropWhenFull<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner, drop: false }
+    }
+}
 
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        match self.inner.start_send(item) {
-            Ok(AsyncSink::NotReady(_)) => {
-                debug!(
-                    message = "Shedding load; dropping event.",
-                    rate_limit_secs = 10
-                );
-                Ok(AsyncSink::Ready)
+impl<T, S: Sink<T> + Unpin> Sink<T> for DropWhenFull<S> {
+    type Error = S::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.project();
+        match this.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                *this.drop = false;
+                Poll::Ready(Ok(()))
             }
-            other => other,
+            Poll::Pending => {
+                *this.drop = true;
+                Poll::Ready(Ok(()))
+            }
+            error => error,
         }
     }
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        self.inner.poll_complete()
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        if self.drop {
+            debug!(
+                message = "Shedding load; dropping event.",
+                internal_log_rate_secs = 10
+            );
+            Ok(())
+        } else {
+            self.project().inner.start_send(item)
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_close(cx)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::{Acker, BufferConfig, DropWhenFull, WhenFull};
-    use crate::test_util::block_on;
-    use futures01::{future, sync::mpsc, task::AtomicTask, Async, AsyncSink, Sink, Stream};
-    use std::sync::{atomic::AtomicUsize, Arc};
+    use crate::sink::BoundedSink;
+    use futures::{future, Sink, Stream};
+    use futures01::task::AtomicTask;
+    use std::{
+        sync::{atomic::AtomicUsize, Arc},
+        task::Poll,
+    };
+    use tokio::sync::mpsc;
     use tokio01_test::task::MockTask;
 
-    #[test]
-    fn drop_when_full() {
-        block_on::<_, _, ()>(future::lazy(|| {
-            let (tx, mut rx) = mpsc::channel(2);
+    #[tokio::test]
+    async fn drop_when_full() {
+        future::lazy(|cx| {
+            let (tx, rx) = mpsc::channel(3);
 
-            let mut tx = DropWhenFull { inner: tx };
+            let mut tx = Box::pin(DropWhenFull::new(BoundedSink::new(tx)));
 
-            assert_eq!(tx.start_send(1), Ok(AsyncSink::Ready));
-            assert_eq!(tx.start_send(2), Ok(AsyncSink::Ready));
-            assert_eq!(tx.start_send(3), Ok(AsyncSink::Ready));
-            assert_eq!(tx.start_send(4), Ok(AsyncSink::Ready));
+            assert_eq!(tx.as_mut().poll_ready(cx), Poll::Ready(Ok(())));
+            assert_eq!(tx.as_mut().start_send(1), Ok(()));
+            assert_eq!(tx.as_mut().poll_ready(cx), Poll::Ready(Ok(())));
+            assert_eq!(tx.as_mut().start_send(2), Ok(()));
+            assert_eq!(tx.as_mut().poll_ready(cx), Poll::Ready(Ok(())));
+            assert_eq!(tx.as_mut().start_send(3), Ok(()));
+            assert_eq!(tx.as_mut().poll_ready(cx), Poll::Ready(Ok(())));
+            assert_eq!(tx.as_mut().start_send(4), Ok(()));
 
-            assert_eq!(rx.poll(), Ok(Async::Ready(Some(1))));
-            assert_eq!(rx.poll(), Ok(Async::Ready(Some(2))));
-            assert_eq!(rx.poll(), Ok(Async::Ready(Some(3))));
-            assert_eq!(rx.poll(), Ok(Async::NotReady));
+            let mut rx = Box::pin(rx);
 
-            future::ok(())
-        }))
-        .unwrap();
+            assert_eq!(rx.as_mut().poll_next(cx), Poll::Ready(Some(1)));
+            assert_eq!(rx.as_mut().poll_next(cx), Poll::Ready(Some(2)));
+            assert_eq!(rx.as_mut().poll_next(cx), Poll::Ready(Some(3)));
+            assert_eq!(rx.as_mut().poll_next(cx), Poll::Pending);
+        })
+        .await;
     }
 
     #[test]
     fn ack_with_none() {
         let counter = Arc::new(AtomicUsize::new(0));
         let task = Arc::new(AtomicTask::new());
-        let acker = Acker::Disk(counter, task.clone());
+        let acker = Acker::Disk(counter, Arc::clone(&task));
 
         let mut mock = MockTask::new();
 

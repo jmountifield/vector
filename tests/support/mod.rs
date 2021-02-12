@@ -1,42 +1,56 @@
 // Using a shared mod like this is probably not the best idea, since we have to
 // disable the `dead_code` lint, as we don't need all of the helpers from here
 // all over the place.
+#![allow(clippy::type_complexity)]
 #![allow(dead_code)]
 
-use futures01::{
+use async_trait::async_trait;
+use futures::{
     future,
-    sink::Sink,
-    stream,
-    sync::mpsc::{Receiver, Sender},
-    Async, Future, Stream,
+    stream::{self, BoxStream},
+    task::Poll,
+    FutureExt, Sink, SinkExt, StreamExt,
 };
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+use std::{
+    fs::{create_dir, OpenOptions},
+    io::{self, Write},
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    task::Context,
 };
+use tokio::sync::mpsc;
 use tracing::{error, info};
-use vector::event::{self, metric::MetricValue, Event, Value};
-use vector::shutdown::ShutdownSignal;
-use vector::sinks::{util::StreamSink, Healthcheck, RouterSink};
-use vector::sources::Source;
-use vector::topology::config::{
-    DataType, GlobalOptions, SinkConfig, SinkContext, SourceConfig, TransformConfig,
-    TransformContext,
+use vector::{
+    buffers::Acker,
+    config::{DataType, GlobalOptions, SinkConfig, SinkContext, SourceConfig, TransformConfig},
+    event::{
+        metric::{self, MetricValue},
+        Value,
+    },
+    shutdown::ShutdownSignal,
+    sinks::{util::StreamSink, Healthcheck, VectorSink},
+    sources::Source,
+    test_util::{runtime, temp_dir, temp_file},
+    transforms::{FunctionTransform, Transform},
+    Event, Pipeline,
 };
-use vector::transforms::Transform;
 
-pub fn sink(channel_size: usize) -> (Receiver<Event>, MockSinkConfig<Sender<Event>>) {
-    let (tx, rx) = futures01::sync::mpsc::channel(channel_size);
+pub fn sink(channel_size: usize) -> (mpsc::Receiver<Event>, MockSinkConfig<Pipeline>) {
+    let (tx, rx) = Pipeline::new_with_buffer(channel_size, vec![]);
     let sink = MockSinkConfig::new(tx, true);
     (rx, sink)
 }
 
 pub fn sink_failing_healthcheck(
     channel_size: usize,
-) -> (Receiver<Event>, MockSinkConfig<Sender<Event>>) {
-    let (tx, rx) = futures01::sync::mpsc::channel(channel_size);
+) -> (mpsc::Receiver<Event>, MockSinkConfig<Pipeline>) {
+    let (tx, rx) = Pipeline::new_with_buffer(channel_size, vec![]);
     let sink = MockSinkConfig::new(tx, false);
     (rx, sink)
 }
@@ -45,15 +59,15 @@ pub fn sink_dead() -> MockSinkConfig<DeadSink<Event>> {
     MockSinkConfig::new(DeadSink::new(), false)
 }
 
-pub fn source() -> (Sender<Event>, MockSourceConfig) {
-    let (tx, rx) = futures01::sync::mpsc::channel(0);
+pub fn source() -> (Pipeline, MockSourceConfig) {
+    let (tx, rx) = Pipeline::new_with_buffer(1, vec![]);
     let source = MockSourceConfig::new(rx);
     (tx, source)
 }
 
-pub fn source_with_event_counter() -> (Sender<Event>, MockSourceConfig, Arc<AtomicUsize>) {
+pub fn source_with_event_counter() -> (Pipeline, MockSourceConfig, Arc<AtomicUsize>) {
     let event_counter = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = futures01::sync::mpsc::channel(0);
+    let (tx, rx) = Pipeline::new_with_buffer(1, vec![]);
     let source = MockSourceConfig::new_with_event_counter(rx, event_counter.clone());
     (tx, source, event_counter)
 }
@@ -62,10 +76,37 @@ pub fn transform(suffix: &str, increase: f64) -> MockTransformConfig {
     MockTransformConfig::new(suffix.to_owned(), increase)
 }
 
+/// Creates a file with given content
+pub fn create_file(config: &str) -> PathBuf {
+    let path = temp_file();
+    overwrite_file(path.clone(), config);
+    path
+}
+
+/// Overwrites file with given content
+pub fn overwrite_file(path: PathBuf, config: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap();
+
+    file.write_all(config.as_bytes()).unwrap();
+    file.flush().unwrap();
+    file.sync_all().unwrap();
+}
+
+pub fn create_directory() -> PathBuf {
+    let path = temp_dir();
+    create_dir(path.clone()).unwrap();
+    path
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MockSourceConfig {
     #[serde(skip)]
-    receiver: Arc<Mutex<Option<Receiver<Event>>>>,
+    receiver: Arc<Mutex<Option<mpsc::Receiver<Event>>>>,
     #[serde(skip)]
     event_counter: Option<Arc<AtomicUsize>>,
     #[serde(skip)]
@@ -73,7 +114,7 @@ pub struct MockSourceConfig {
 }
 
 impl MockSourceConfig {
-    pub fn new(receiver: Receiver<Event>) -> Self {
+    pub fn new(receiver: mpsc::Receiver<Event>) -> Self {
         Self {
             receiver: Arc::new(Mutex::new(Some(receiver))),
             event_counter: None,
@@ -82,7 +123,7 @@ impl MockSourceConfig {
     }
 
     pub fn new_with_event_counter(
-        receiver: Receiver<Event>,
+        receiver: mpsc::Receiver<Event>,
         event_counter: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -97,47 +138,46 @@ impl MockSourceConfig {
     }
 }
 
+#[async_trait]
 #[typetag::serde(name = "mock")]
 impl SourceConfig for MockSourceConfig {
-    fn build(
+    async fn build(
         &self,
         _name: &str,
         _globals: &GlobalOptions,
         shutdown: ShutdownSignal,
-        out: Sender<Event>,
+        out: Pipeline,
     ) -> Result<Source, vector::Error> {
         let wrapped = self.receiver.clone();
         let event_counter = self.event_counter.clone();
         let mut recv = wrapped.lock().unwrap().take().unwrap();
         let mut shutdown = Some(shutdown);
-        let mut token = None;
-        let source = future::lazy(move || {
-            stream::poll_fn(move || {
+        let mut _token = None;
+        Ok(Box::pin(async move {
+            stream::poll_fn(move |cx| {
                 if let Some(until) = shutdown.as_mut() {
-                    match until.poll() {
-                        Ok(Async::Ready(res)) => {
-                            token = Some(res);
+                    match until.poll_unpin(cx) {
+                        Poll::Ready(res) => {
+                            _token = Some(res);
                             shutdown.take();
                             recv.close();
                         }
-                        Err(_) => {
-                            shutdown.take();
-                        }
-                        Ok(Async::NotReady) => {}
+                        Poll::Pending => {}
                     }
                 }
-                recv.poll()
+
+                recv.poll_next_unpin(cx)
             })
-            .map(move |x| {
+            .inspect(move |_| {
                 if let Some(counter) = &event_counter {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-                x
             })
-            .forward(out.sink_map_err(|e| error!("Error sending in sink {}", e)))
-            .map(|_| info!("finished sending"))
-        });
-        Ok(Box::new(source))
+            .map(Ok)
+            .forward(out.sink_map_err(|error| error!(message = "Error sending in sink..", %error)))
+            .inspect(|_| info!("Finished sending."))
+            .await
+        }))
     }
 
     fn output_type(&self) -> DataType {
@@ -149,32 +189,35 @@ impl SourceConfig for MockSourceConfig {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct MockTransform {
     suffix: String,
     increase: f64,
 }
 
-impl Transform for MockTransform {
-    fn transform(&mut self, mut event: Event) -> Option<Event> {
+impl FunctionTransform for MockTransform {
+    fn transform(&mut self, output: &mut Vec<Event>, mut event: Event) {
         match &mut event {
             Event::Log(log) => {
                 let mut v = log
-                    .get(&event::log_schema().message_key())
+                    .get(vector::config::log_schema().message_key())
                     .unwrap()
                     .to_string_lossy();
                 v.push_str(&self.suffix);
-                log.insert(event::log_schema().message_key().clone(), Value::from(v));
+                log.insert(vector::config::log_schema().message_key(), Value::from(v));
             }
-            Event::Metric(metric) => match metric.value {
+            Event::Metric(metric) => match metric.data.value {
                 MetricValue::Counter { ref mut value } => {
                     *value += self.increase;
                 }
                 MetricValue::Distribution {
-                    ref mut values,
-                    ref mut sample_rates,
+                    ref mut samples,
+                    statistic: _,
                 } => {
-                    values.push(self.increase);
-                    sample_rates.push(1);
+                    samples.push(metric::Sample {
+                        value: self.increase,
+                        rate: 1,
+                    });
                 }
                 MetricValue::AggregatedHistogram {
                     ref mut count,
@@ -200,11 +243,11 @@ impl Transform for MockTransform {
                 }
             },
         };
-        Some(event)
+        output.push(event);
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MockTransformConfig {
     suffix: String,
     increase: f64,
@@ -216,10 +259,11 @@ impl MockTransformConfig {
     }
 }
 
+#[async_trait]
 #[typetag::serde(name = "mock")]
 impl TransformConfig for MockTransformConfig {
-    fn build(&self, _cx: TransformContext) -> Result<Box<dyn Transform>, vector::Error> {
-        Ok(Box::new(MockTransform {
+    async fn build(&self) -> Result<Transform, vector::Error> {
+        Ok(Transform::function(MockTransform {
             suffix: self.suffix.clone(),
             increase: self.increase,
         }))
@@ -241,8 +285,8 @@ impl TransformConfig for MockTransformConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MockSinkConfig<T>
 where
-    T: Sink<SinkItem = Event> + std::fmt::Debug + Clone + Send + 'static,
-    <T as Sink>::SinkError: std::fmt::Debug,
+    T: Sink<Event> + Unpin + std::fmt::Debug + Clone + Send + Sync + 'static,
+    <T as Sink<Event>>::Error: std::fmt::Display,
 {
     #[serde(skip)]
     sink: Option<T>,
@@ -252,8 +296,8 @@ where
 
 impl<T> MockSinkConfig<T>
 where
-    T: Sink<SinkItem = Event> + std::fmt::Debug + Clone + Send + 'static,
-    <T as Sink>::SinkError: std::fmt::Debug,
+    T: Sink<Event> + Unpin + std::fmt::Debug + Clone + Send + Sync + 'static,
+    <T as Sink<Event>>::Error: std::fmt::Display,
 {
     pub fn new(sink: T, healthy: bool) -> Self {
         Self {
@@ -269,23 +313,26 @@ enum HealthcheckError {
     Unhealthy,
 }
 
+#[async_trait]
 #[typetag::serialize(name = "mock")]
 impl<T> SinkConfig for MockSinkConfig<T>
 where
-    T: Sink<SinkItem = Event> + std::fmt::Debug + Clone + Send + 'static,
-    <T as Sink>::SinkError: std::fmt::Debug,
+    T: Sink<Event> + Unpin + std::fmt::Debug + Clone + Send + Sync + 'static,
+    <T as Sink<Event>>::Error: std::fmt::Display,
 {
-    fn build(&self, cx: SinkContext) -> Result<(RouterSink, Healthcheck), vector::Error> {
-        let sink = self.sink.clone().unwrap();
-        let sink = sink.sink_map_err(|error| {
-            error!(message = "Ingesting an event failed at mock sink", ?error)
-        });
-        let sink = StreamSink::new(sink, cx.acker());
-        let healthcheck = match self.healthy {
-            true => future::ok(()),
-            false => future::err(HealthcheckError::Unhealthy.into()),
+    async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck), vector::Error> {
+        let sink = MockSink {
+            acker: cx.acker(),
+            sink: self.sink.clone().unwrap(),
         };
-        Ok((Box::new(sink), Box::new(healthcheck)))
+
+        let healthcheck = if self.healthy {
+            future::ok(())
+        } else {
+            future::err(HealthcheckError::Unhealthy.into())
+        };
+
+        Ok((VectorSink::Stream(Box::new(sink)), healthcheck.boxed()))
     }
 
     fn input_type(&self) -> DataType {
@@ -301,6 +348,30 @@ where
     }
 }
 
+struct MockSink<S> {
+    acker: Acker,
+    sink: S,
+}
+
+#[async_trait]
+impl<S> StreamSink for MockSink<S>
+where
+    S: Sink<Event> + Send + std::marker::Unpin,
+    <S as Sink<Event>>::Error: std::fmt::Display,
+{
+    async fn run(&mut self, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
+        while let Some(event) = input.next().await {
+            if let Err(error) = self.sink.send(event).await {
+                error!(message = "Ingesting an event failed at mock sink.", %error);
+            }
+
+            self.acker.ack(1);
+        }
+
+        Ok(())
+    }
+}
+
 /// Represents a sink that's never ready.
 /// Useful to simulate an upstream sink server that is down.
 #[derive(Debug, Clone)]
@@ -312,18 +383,52 @@ impl<T> DeadSink<T> {
     }
 }
 
-impl<T> Sink for DeadSink<T> {
-    type SinkItem = T;
-    type SinkError = &'static str;
+impl<T> Sink<T> for DeadSink<T> {
+    type Error = &'static str;
 
-    fn start_send(
-        &mut self,
-        item: Self::SinkItem,
-    ) -> futures01::StartSend<Self::SinkItem, Self::SinkError> {
-        Ok(futures01::AsyncSink::NotReady(item))
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
     }
 
-    fn poll_complete(&mut self) -> futures01::Poll<(), Self::SinkError> {
-        Ok(futures01::Async::Ready(()))
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
     }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn start_send(self: Pin<&mut Self>, _item: T) -> Result<(), Self::Error> {
+        Err("never ready")
+    }
+}
+
+/// Takes a test name and a future, and uses `rusty_fork` to perform a cross-platform
+/// process fork. This allows us to test functionality without conflicting with global
+/// state that may have been set/mutated from previous tests
+pub fn fork_test<T: std::future::Future<Output = ()>>(test_name: &'static str, fut: T) {
+    let fork_id = rusty_fork::rusty_fork_id!();
+
+    rusty_fork::fork(
+        test_name,
+        fork_id,
+        |_| {},
+        |child, f| {
+            let status = child.wait().expect("Couldn't wait for child process");
+
+            // Copy all output
+            let mut stdout = io::stdout();
+            io::copy(f, &mut stdout).expect("Couldn't write to stdout");
+
+            // If the test failed, panic on the parent thread
+            if !status.success() {
+                panic!("Test failed");
+            }
+        },
+        || {
+            let mut rt = runtime();
+            rt.block_on(fut);
+        },
+    )
+    .expect("Couldn't fork test");
 }

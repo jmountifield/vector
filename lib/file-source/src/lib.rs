@@ -3,20 +3,38 @@ extern crate scan_fmt;
 #[macro_use]
 extern crate tracing;
 
+mod checkpointer;
 mod file_server;
 mod file_watcher;
+mod fingerprinter;
+mod internal_events;
 mod metadata_ext;
 pub mod paths_provider;
 
-pub use self::file_server::{FileServer, Fingerprinter, Shutdown as FileServerShutdown};
+pub use self::file_server::{FileServer, Shutdown as FileServerShutdown};
+pub use self::fingerprinter::{FingerprintStrategy, Fingerprinter};
+pub use self::internal_events::FileSourceInternalEvents;
 
-type FileFingerprint = u64;
 type FilePosition = u64;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ReadFrom {
+    Beginning,
+    End,
+    Checkpoint(FilePosition),
+}
+
+impl Default for ReadFrom {
+    fn default() -> Self {
+        ReadFrom::Beginning
+    }
+}
 
 #[cfg(test)]
 mod test {
     use self::file_watcher::FileWatcher;
     use super::*;
+    use bytes::Bytes;
     use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
     use std::fs;
     use std::io::Write;
@@ -135,7 +153,7 @@ mod test {
                 start_idx = self.read_idx;
                 end_idx = self.read_idx;
             }
-            // Seek end_idx foward until we hit the newline character.
+            // Seek end_idx forward until we hit the newline character.
             while self.contents[end_idx] != b'\n' {
                 end_idx += 1;
                 if end_idx == max {
@@ -153,28 +171,36 @@ mod test {
             // cause trimmed reads and the only remaining character in the
             // line is the newline. Womp womp
             if !ret.is_empty() {
-                return Some(ret.to_string());
+                Some(ret.to_string())
             } else {
-                return None;
+                None
             }
         }
     }
 
     impl Arbitrary for FWAction {
-        fn arbitrary<G>(g: &mut G) -> FWAction
-        where
-            G: Gen,
-        {
-            let i: usize = g.gen_range(0, 100);
-            let ln_sz = g.gen_range(1, 32);
-            let pause = g.gen_range(1, 3);
+        fn arbitrary(g: &mut Gen) -> FWAction {
+            let i: usize = *g.choose(&(0..100).collect::<Vec<_>>()).unwrap();
             match i {
                 // These weights are more or less arbitrary. 'Pause' maybe
                 // doesn't have a use but we keep it in place to allow for
                 // variations in file-system flushes.
-                0..=50 => FWAction::WriteLine(g.gen_ascii_chars().take(ln_sz).collect()),
+                0..=50 => {
+                    const GEN_ASCII_STR_CHARSET: &[u8] =
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                    let ln_sz = *g.choose(&(1..32).collect::<Vec<_>>()).unwrap();
+                    FWAction::WriteLine(
+                        std::iter::repeat_with(|| *g.choose(&GEN_ASCII_STR_CHARSET).unwrap())
+                            .take(ln_sz)
+                            .map(|v| -> char { v.into() })
+                            .collect(),
+                    )
+                }
                 51..=69 => FWAction::Read,
-                70..=75 => FWAction::Pause(pause),
+                70..=75 => {
+                    let pause = *g.choose(&(1..3).collect::<Vec<_>>()).unwrap();
+                    FWAction::Pause(pause)
+                }
                 76..=85 => FWAction::RotateFile,
                 86..=90 => FWAction::TruncateFile,
                 91..=95 => FWAction::DeleteFile,
@@ -201,7 +227,14 @@ mod test {
         let path = dir.path().join("a_file.log");
         let mut fp = fs::File::create(&path).expect("could not create");
         let mut rotation_count = 0;
-        let mut fw = FileWatcher::new(path.clone(), 0, None).expect("must be able to create");
+        let mut fw = FileWatcher::new(
+            path.clone(),
+            ReadFrom::Beginning,
+            None,
+            100_000,
+            Bytes::from("\n"),
+        )
+        .expect("must be able to create");
 
         let mut writes = 0;
         let mut sut_reads = 0;
@@ -240,7 +273,7 @@ mod test {
                 FWAction::WriteLine(ref s) => {
                     fwfiles[0].write_line(s);
                     assert!(fp.write(s.as_bytes()).is_ok());
-                    assert!(fp.write("\n".as_bytes()).is_ok());
+                    assert!(fp.write(b"\n").is_ok());
                     assert!(fp.flush().is_ok());
                     writes += 1;
                 }
@@ -254,14 +287,17 @@ mod test {
                     read_index += 1;
                 }
                 FWAction::Read => {
-                    let mut buf = Vec::new();
                     let mut attempts = 10;
                     while attempts > 0 {
-                        match fw.read_line(&mut buf, 100_000) {
+                        match fw.read_line() {
                             Err(_) => {
                                 unreachable!();
                             }
-                            Ok(0) => {
+                            Ok(Some(line)) if line.is_empty() => {
+                                attempts -= 1;
+                                continue;
+                            }
+                            Ok(None) => {
                                 attempts -= 1;
                                 continue;
                             }
@@ -293,7 +329,14 @@ mod test {
         let path = dir.path().join("a_file.log");
         let mut fp = fs::File::create(&path).expect("could not create");
         let mut rotation_count = 0;
-        let mut fw = FileWatcher::new(path.clone(), 0, None).expect("must be able to create");
+        let mut fw = FileWatcher::new(
+            path.clone(),
+            ReadFrom::Beginning,
+            None,
+            100_000,
+            Bytes::from("\n"),
+        )
+        .expect("must be able to create");
 
         let mut fwfiles: Vec<FWFile> = vec![];
         fwfiles.push(FWFile::new());
@@ -312,7 +355,7 @@ mod test {
                 FWAction::WriteLine(ref s) => {
                     fwfiles[0].write_line(s);
                     assert!(fp.write(s.as_bytes()).is_ok());
-                    assert!(fp.write("\n".as_bytes()).is_ok());
+                    assert!(fp.write(b"\n").is_ok());
                     assert!(fp.flush().is_ok());
                 }
                 FWAction::RotateFile => {
@@ -325,24 +368,27 @@ mod test {
                     read_index += 1;
                 }
                 FWAction::Read => {
-                    let mut buf = Vec::new();
                     let mut attempts = 10;
                     while attempts > 0 {
-                        match fw.read_line(&mut buf, 100_000) {
+                        match fw.read_line() {
                             Err(_) => {
                                 unreachable!();
                             }
-                            Ok(0) => {
+                            Ok(Some(line)) if line.is_empty() => {
                                 attempts -= 1;
                                 assert!(fwfiles[read_index].read_line().is_none());
                                 continue;
                             }
-                            Ok(sz) => {
+                            Ok(None) => {
+                                attempts -= 1;
+                                assert!(fwfiles[read_index].read_line().is_none());
+                                continue;
+                            }
+                            Ok(Some(line)) => {
                                 let exp =
                                     fwfiles[read_index].read_line().expect("could not readline");
-                                assert_eq!(exp.into_bytes(), buf);
-                                assert_eq!(sz, buf.len() + 1);
-                                buf.clear();
+                                assert_eq!(exp.into_bytes(), line);
+                                // assert_eq!(sz, buf.len() + 1);
                                 break;
                             }
                         }

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "shutdown-tests"))]
+#![cfg(feature = "shutdown-tests")]
 
 use assert_cmd::prelude::*;
 use nix::{
@@ -6,24 +6,30 @@ use nix::{
     unistd::Pid,
 };
 use std::{
-    fs::OpenOptions,
     io::Write,
     net::SocketAddr,
     path::PathBuf,
-    process::Command,
+    process::{Child, Command},
     thread::sleep,
     time::{Duration, Instant},
 };
-use vector::test_util::{next_addr, temp_dir, temp_file};
+use vector::test_util::{next_addr, temp_file};
+
+mod support;
+use crate::support::{create_directory, create_file, overwrite_file};
+
+const STARTUP_TIME: Duration = Duration::from_secs(2);
+const SHUTDOWN_TIME: Duration = Duration::from_secs(3);
+const RELOAD_TIME: Duration = Duration::from_secs(5);
 
 const STDIO_CONFIG: &'static str = r#"
     data_dir = "${VECTOR_DATA_DIR}"
 
-    [sources.in]
+    [sources.in_console]
         type = "stdin"
 
-    [sinks.out]
-        inputs = ["in"]
+    [sinks.out_console]
+        inputs = ["in_console"]
         type = "console"
         encoding = "text"
 "#;
@@ -43,33 +49,11 @@ const PROMETHEUS_SINK_CONFIG: &'static str = r#"
           field = "time"
 
     [sinks.out]
-        type = "prometheus"
+        type = "prometheus_exporter"
+        default_namespace = "service"
         inputs = ["log_to_metric"]
         address = "${VECTOR_TEST_ADDRESS}"
-        namespace = "service"
 "#;
-
-/// Creates a file with given content
-fn create_file(config: &str) -> PathBuf {
-    let path = temp_file();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path.clone())
-        .unwrap();
-
-    file.write_all(config.as_bytes()).unwrap();
-    file.flush().unwrap();
-
-    path
-}
-
-fn create_directory() -> PathBuf {
-    let path = temp_dir();
-    Command::new("mkdir").arg(path.clone()).assert().success();
-    path
-}
 
 fn source_config(source: &str) -> String {
     format!(
@@ -93,14 +77,14 @@ fn source_vector(source: &str) -> Command {
 }
 
 fn vector(config: &str) -> Command {
-    vector_with_address(config, next_addr())
+    vector_with(create_file(config), next_addr(), false)
 }
 
-fn vector_with_address(config: &str, address: SocketAddr) -> Command {
+fn vector_with(config_path: PathBuf, address: SocketAddr, quiet: bool) -> Command {
     let mut cmd = Command::cargo_bin("vector").unwrap();
     cmd.arg("-c")
-        .arg(create_file(config))
-        .arg("--quiet")
+        .arg(config_path)
+        .arg(if quiet { "--quiet" } else { "-v" })
         .env("VECTOR_DATA_DIR", create_directory())
         .env("VECTOR_TEST_UNIX_PATH", temp_file())
         .env("VECTOR_TEST_ADDRESS", format!("{}", address));
@@ -109,20 +93,25 @@ fn vector_with_address(config: &str, address: SocketAddr) -> Command {
 }
 
 fn test_timely_shutdown(cmd: Command) {
-    test_timely_shutdown_with_sub(cmd, || ());
+    test_timely_shutdown_with_sub(cmd, |_| ());
 }
 
-fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce()) {
-    let mut vector = cmd.stdin(std::process::Stdio::piped()).spawn().unwrap();
+/// Returns stdout output
+fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce(&mut Child)) {
+    let mut vector = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
 
     // Give vector time to start.
-    sleep(Duration::from_secs(1));
+    sleep(STARTUP_TIME);
 
     // Check if vector is still running
     assert_eq!(None, vector.try_wait().unwrap(), "Vector exited too early.");
 
     // Run sub while this vector is running.
-    sub();
+    sub(&mut vector);
 
     // Signal shutdown
     kill(Pid::from_raw(vector.id() as i32), Signal::SIGTERM).unwrap();
@@ -131,21 +120,25 @@ fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce()) {
     let now = Instant::now();
 
     // Wait for shutdown
-    assert!(
-        vector.wait().unwrap().success(),
-        "Vector didn't exit successfully."
-    );
+    let output = vector.wait_with_output().unwrap();
+
+    // Check output
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        println!("{}", stdout);
+        panic!("Vector didn't exit successfully. Status: {}", output.status);
+    }
 
     // Check if vector has shutdown in a reasonable time
     assert!(
-        now.elapsed() < Duration::from_secs(3),
+        now.elapsed() < SHUTDOWN_TIME,
         "Shutdown lasted for more than 3 seconds."
     );
 }
 
 #[test]
 fn auto_shutdown() {
-    let mut cmd = Command::cargo_bin("vector").unwrap();
+    let mut cmd = assert_cmd::Command::cargo_bin("vector").unwrap();
     cmd.arg("--quiet")
         .arg("-c")
         .arg(create_file(STDIO_CONFIG))
@@ -154,9 +147,65 @@ fn auto_shutdown() {
     // Once `stdin source` reads whole buffer it will automatically
     // shutdown which will also cause vector process to shutdown
     // because all sources have shutdown.
-    let assert = cmd.with_stdin().buffer("42").assert();
+    let assert = cmd.write_stdin("42").assert();
 
     assert.success().stdout("42\n");
+}
+
+#[test]
+fn configuration_path_recomputed() {
+    // Directory with configuration files
+    let dir = create_directory();
+
+    // First configuration file
+    overwrite_file(
+        dir.join("conf1.toml"),
+        &source_config(
+            r#"
+        type = "generator"
+        format = "shuffle"
+        interval = 1.0 # optional, no default
+        lines = ["foo", "bar"]"#,
+        ),
+    );
+
+    // Vector command
+    let mut cmd = vector_with(dir.join("*"), next_addr(), true);
+
+    // Run vector
+    let mut vector = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Give vector time to start.
+    sleep(STARTUP_TIME);
+
+    // Second configuration file
+    overwrite_file(dir.join("conf2.toml"), STDIO_CONFIG);
+    // Clean the first file so to have only the console source.
+    overwrite_file(dir.join("conf1.toml"), &"");
+
+    // Signal reload
+    kill(Pid::from_raw(vector.id() as i32), Signal::SIGHUP).unwrap();
+
+    // Message to assert, sended to console source and picked up from
+    // console sink, both added in the second configuration file.
+    vector
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all("42".as_bytes())
+        .unwrap();
+
+    // Wait for shutdown
+    // Test will hang here if the other config isn't picked up.
+    let output = vector.wait_with_output().unwrap();
+    assert!(output.status.success(), "Vector didn't exit successfully.");
+
+    // Output
+    assert_eq!(output.stdout.as_slice(), "42\n".as_bytes());
 }
 
 #[test]
@@ -178,8 +227,9 @@ fn timely_shutdown_generator() {
     test_timely_shutdown(source_vector(
         r#"
     type = "generator"
-    batch_interval = 1.0 # optional, no default
-    lines = []"#,
+    format = "shuffle"
+    interval = 1.0 # optional, no default
+    lines = ["foo", "bar"]"#,
     ));
 }
 
@@ -188,15 +238,16 @@ fn timely_shutdown_http() {
     test_timely_shutdown(source_vector(
         r#"
     type = "http"
-    address = "${VECTOR_TEST_ADDRESS}""#,
+    address = "${VECTOR_TEST_ADDRESS}"
+    encoding = "text""#,
     ));
 }
 
 #[test]
-fn timely_shutdown_logplex() {
+fn timely_shutdown_heroku_logs() {
     test_timely_shutdown(source_vector(
         r#"
-    type = "logplex"
+    type = "heroku_logs"
     address = "${VECTOR_TEST_ADDRESS}""#,
     ));
 }
@@ -218,17 +269,23 @@ fn timely_shutdown_journald() {
 #[test]
 fn timely_shutdown_prometheus() {
     let address = next_addr();
-    test_timely_shutdown_with_sub(vector_with_address(PROMETHEUS_SINK_CONFIG, address), || {
-        test_timely_shutdown(vector_with_address(
-            source_config(
-                r#"
-        type = "prometheus"
+    test_timely_shutdown_with_sub(
+        vector_with(create_file(PROMETHEUS_SINK_CONFIG), address, false),
+        |_| {
+            test_timely_shutdown(vector_with(
+                create_file(
+                    source_config(
+                        r#"
+        type = "prometheus_scrape"
         hosts = ["http://${VECTOR_TEST_ADDRESS}"]"#,
-            )
-            .as_str(),
-            address,
-        ));
-    });
+                    )
+                    .as_str(),
+                ),
+                address,
+                false,
+            ));
+        },
+    );
 }
 
 #[test]
@@ -274,6 +331,7 @@ fn timely_shutdown_socket_unix() {
 
 #[test]
 fn timely_shutdown_splunk_hec() {
+    vector::test_util::trace_init();
     test_timely_shutdown(source_vector(
         r#"
     type = "splunk_hec"
@@ -283,15 +341,18 @@ fn timely_shutdown_splunk_hec() {
 
 #[test]
 fn timely_shutdown_statsd() {
+    vector::test_util::trace_init();
     test_timely_shutdown(source_vector(
         r#"
     type = "statsd"
+    mode = "tcp"
     address = "${VECTOR_TEST_ADDRESS}""#,
     ));
 }
 
 #[test]
 fn timely_shutdown_syslog_tcp() {
+    vector::test_util::trace_init();
     test_timely_shutdown(source_vector(
         r#"
         type = "syslog"
@@ -377,4 +438,43 @@ fn timely_shutdown_lua_timer() {
   target = "stdout"
 "#,
     ));
+}
+
+#[test]
+fn timely_reload_shutdown() {
+    let path = create_file(
+        source_config(
+            r#"
+            type = "socket"
+            address = "${VECTOR_TEST_ADDRESS}"
+            mode = "tcp""#,
+        )
+        .as_str(),
+    );
+
+    let mut cmd = vector_with(path.clone(), next_addr(), false);
+    cmd.arg("-w true");
+
+    test_timely_shutdown_with_sub(cmd, |vector| {
+        overwrite_file(
+            path,
+            source_config(
+                r#"
+                type = "socket"
+                address = "${VECTOR_TEST_ADDRESS}"
+                mode = "udp""#,
+            )
+            .as_str(),
+        );
+
+        // Give vector time to reload.
+        sleep(RELOAD_TIME);
+
+        // Check if vector is still running
+        assert_eq!(
+            None,
+            vector.try_wait().unwrap(),
+            "Vector exited too early on reload."
+        );
+    });
 }

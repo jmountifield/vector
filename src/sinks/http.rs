@@ -1,26 +1,28 @@
 use crate::{
-    dns::Resolver,
-    event::{self, Event},
+    config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
+    event::Event,
+    http::{Auth, HttpClient, MaybeAuth},
+    internal_events::{HTTPEventEncoded, HTTPEventMissingMessage},
     sinks::util::{
+        buffer::compression::GZIP_DEFAULT,
         encoding::{EncodingConfig, EncodingConfiguration},
-        http2::{Auth, BatchedHttpSink, HttpClient, HttpSink},
-        service2::TowerRequestConfig,
-        BatchBytesConfig, Buffer, Compression, UriSerde,
+        http::{BatchedHttpSink, HttpSink, RequestConfig},
+        BatchConfig, BatchSettings, Buffer, Compression, Concurrency, TowerRequestConfig, UriSerde,
     },
     tls::{TlsOptions, TlsSettings},
-    topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
 };
-use futures::{FutureExt, TryFutureExt};
-use futures01::{future, Sink};
-use http02::{
+use flate2::write::GzEncoder;
+use futures::{future, FutureExt, SinkExt};
+use http::{
     header::{self, HeaderName, HeaderValue},
     Method, Request, StatusCode, Uri,
 };
-use hyper13::Body;
+use hyper::Body;
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use std::io::Write;
 
 #[derive(Debug, Snafu)]
 enum BuildError {
@@ -41,16 +43,16 @@ enum BuildError {
 pub struct HttpSinkConfig {
     pub uri: UriSerde,
     pub method: Option<HttpMethod>,
-    pub healthcheck_uri: Option<UriSerde>,
     pub auth: Option<Auth>,
+    // Deprecated, moved to request.
     pub headers: Option<IndexMap<String, String>>,
     #[serde(default)]
     pub compression: Compression,
     pub encoding: EncodingConfig<Encoding>,
     #[serde(default)]
-    pub batch: BatchBytesConfig,
+    pub batch: BatchConfig,
     #[serde(default)]
-    pub request: TowerRequestConfig,
+    pub request: RequestConfig,
     pub tls: Option<TlsOptions>,
 }
 
@@ -59,7 +61,6 @@ fn default_config(e: Encoding) -> HttpSinkConfig {
     HttpSinkConfig {
         uri: Default::default(),
         method: Default::default(),
-        healthcheck_uri: Default::default(),
         auth: Default::default(),
         headers: Default::default(),
         compression: Default::default(),
@@ -72,9 +73,9 @@ fn default_config(e: Encoding) -> HttpSinkConfig {
 
 lazy_static! {
     static ref REQUEST_DEFAULTS: TowerRequestConfig = TowerRequestConfig {
-        in_flight_limit: Some(10),
+        concurrency: Concurrency::Fixed(10),
         timeout_secs: Some(30),
-        rate_limit_num: Some(10),
+        rate_limit_num: Some(u64::max_value()),
         ..Default::default()
     };
 }
@@ -97,44 +98,64 @@ pub enum Encoding {
 }
 
 inventory::submit! {
-    SinkDescription::new_without_default::<HttpSinkConfig>("http")
+    SinkDescription::new::<HttpSinkConfig>("http")
 }
 
+impl GenerateConfig for HttpSinkConfig {
+    fn generate_config() -> toml::Value {
+        toml::from_str(
+            r#"uri = "https://10.22.212.22:9000/endpoint"
+            encoding.codec = "json""#,
+        )
+        .unwrap()
+    }
+}
+
+#[async_trait::async_trait]
 #[typetag::serde(name = "http")]
 impl SinkConfig for HttpSinkConfig {
-    fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
-        validate_headers(&self.headers, &self.auth)?;
+    async fn build(
+        &self,
+        cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
         let tls = TlsSettings::from_options(&self.tls)?;
+        let client = HttpClient::new(tls)?;
 
-        let mut config = self.clone();
-        config.uri = build_uri(config.uri.clone()).into();
+        let healthcheck = match cx.healthcheck.uri.clone() {
+            Some(healthcheck_uri) => {
+                healthcheck(healthcheck_uri, self.auth.clone(), client.clone()).boxed()
+            }
+            None => future::ok(()).boxed(),
+        };
 
-        let compression = config.compression;
-        let batch = config.batch.unwrap_or(bytesize::mib(10u64), 1);
-        let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+        let mut config = HttpSinkConfig {
+            auth: self.auth.choose_one(&self.uri.auth)?,
+            uri: self.uri.with_default_parts(),
+            ..self.clone()
+        };
+
+        config.request.add_old_option(config.headers.take());
+        validate_headers(&config.request.headers, &config.auth)?;
+
+        let batch = BatchSettings::default()
+            .bytes(bytesize::mib(10u64))
+            .timeout(1)
+            .parse_config(config.batch)?;
+        let request = config.request.tower.unwrap_with(&REQUEST_DEFAULTS);
 
         let sink = BatchedHttpSink::new(
             config,
-            Buffer::new(compression),
+            Buffer::new(batch.size, Compression::None),
             request,
-            batch,
-            Some(tls.clone()),
-            &cx,
+            batch.timeout,
+            client,
+            cx.acker(),
         )
-        .sink_map_err(|e| error!("Fatal http sink error: {}", e));
+        .sink_map_err(|error| error!(message = "Fatal HTTP sink error.", %error));
 
-        let sink = Box::new(sink);
+        let sink = super::VectorSink::Sink(Box::new(sink));
 
-        match self.healthcheck_uri.clone() {
-            Some(healthcheck_uri) => {
-                let healthcheck =
-                    healthcheck(healthcheck_uri, self.auth.clone(), cx.resolver(), tls)
-                        .boxed()
-                        .compat();
-                Ok((sink, Box::new(healthcheck)))
-            }
-            None => Ok((sink, Box::new(future::ok(())))),
-        }
+        Ok((sink, healthcheck))
     }
 
     fn input_type(&self) -> DataType {
@@ -146,6 +167,7 @@ impl SinkConfig for HttpSinkConfig {
     }
 }
 
+#[async_trait::async_trait]
 impl HttpSink for HttpSinkConfig {
     type Input = Vec<u8>;
     type Output = Vec<u8>;
@@ -156,22 +178,19 @@ impl HttpSink for HttpSinkConfig {
 
         let body = match &self.encoding.codec() {
             Encoding::Text => {
-                if let Some(v) = event.get(&event::log_schema().message_key()) {
+                if let Some(v) = event.get(crate::config::log_schema().message_key()) {
                     let mut b = v.to_string_lossy().into_bytes();
                     b.push(b'\n');
                     b
                 } else {
-                    warn!(
-                        message = "Event missing the message key; Dropping event.",
-                        rate_limit_secs = 30,
-                    );
+                    emit!(HTTPEventMissingMessage);
                     return None;
                 }
             }
 
             Encoding::Ndjson => {
                 let mut b = serde_json::to_vec(&event)
-                    .map_err(|e| panic!("Unable to encode into JSON: {}", e))
+                    .map_err(|error| panic!("Unable to encode into JSON: {}", error))
                     .ok()?;
                 b.push(b'\n');
                 b
@@ -179,22 +198,26 @@ impl HttpSink for HttpSinkConfig {
 
             Encoding::Json => {
                 let mut b = serde_json::to_vec(&event)
-                    .map_err(|e| panic!("Unable to encode into JSON: {}", e))
+                    .map_err(|error| panic!("Unable to encode into JSON: {}", error))
                     .ok()?;
                 b.push(b',');
                 b
             }
         };
 
+        emit!(HTTPEventEncoded {
+            byte_size: body.len(),
+        });
+
         Some(body)
     }
 
-    fn build_request(&self, mut body: Self::Output) -> http02::Request<Vec<u8>> {
+    async fn build_request(&self, mut body: Self::Output) -> crate::Result<http::Request<Vec<u8>>> {
         let method = match &self.method.clone().unwrap_or(HttpMethod::Post) {
             HttpMethod::Post => Method::POST,
             HttpMethod::Put => Method::PUT,
         };
-        let uri: Uri = self.uri.clone().into();
+        let uri: Uri = self.uri.uri.clone();
 
         let ct = match self.encoding.codec() {
             Encoding::Text => "text/plain",
@@ -212,14 +235,20 @@ impl HttpSink for HttpSinkConfig {
             .uri(uri)
             .header("Content-Type", ct);
 
-        if let Some(ce) = self.compression.content_encoding() {
-            builder = builder.header("Content-Encoding", ce);
+        match self.compression {
+            Compression::Gzip(level) => {
+                builder = builder.header("Content-Encoding", "gzip");
+
+                let level = level.unwrap_or(GZIP_DEFAULT) as u32;
+                let mut w = GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+                w.write_all(&body).expect("Writing to Vec can't fail");
+                body = w.finish().expect("Writing to Vec can't fail");
+            }
+            Compression::None => {}
         }
 
-        if let Some(headers) = &self.headers {
-            for (header, value) in headers.iter() {
-                builder = builder.header(header.as_str(), value.as_str());
-            }
+        for (header, value) in self.request.headers.iter() {
+            builder = builder.header(header.as_str(), value.as_str());
         }
 
         let mut request = builder.body(body).unwrap();
@@ -228,60 +257,38 @@ impl HttpSink for HttpSinkConfig {
             auth.apply(&mut request);
         }
 
-        request
+        Ok(request)
     }
 }
 
-async fn healthcheck(
-    uri: UriSerde,
-    auth: Option<Auth>,
-    resolver: Resolver,
-    tls_settings: TlsSettings,
-) -> crate::Result<()> {
-    let uri = build_uri(uri);
-    let mut request = Request::head(&uri).body(Body::empty()).unwrap();
+async fn healthcheck(uri: UriSerde, auth: Option<Auth>, client: HttpClient) -> crate::Result<()> {
+    let auth = auth.choose_one(&uri.auth)?;
+    let uri = uri.with_default_parts();
+    let mut request = Request::head(&uri.uri).body(Body::empty()).unwrap();
 
     if let Some(auth) = auth {
         auth.apply(&mut request);
     }
 
-    let mut client = HttpClient::new(resolver, tls_settings)?;
     let response = client.send(request).await?;
 
     match response.status() {
         StatusCode::OK => Ok(()),
-        status => Err(super::HealthcheckError::UnexpectedStatus2 { status }.into()),
+        status => Err(super::HealthcheckError::UnexpectedStatus { status }.into()),
     }
 }
 
-fn validate_headers(
-    headers: &Option<IndexMap<String, String>>,
-    auth: &Option<Auth>,
-) -> crate::Result<()> {
-    if let Some(map) = headers {
-        for (name, value) in map {
-            if auth.is_some() && name.eq_ignore_ascii_case("Authorization") {
-                return Err(
-                    "Authorization header can not be used with defined auth options".into(),
-                );
-            }
-
-            HeaderName::from_bytes(name.as_bytes()).with_context(|| InvalidHeaderName { name })?;
-            HeaderValue::from_bytes(value.as_bytes())
-                .with_context(|| InvalidHeaderValue { value })?;
+fn validate_headers(map: &IndexMap<String, String>, auth: &Option<Auth>) -> crate::Result<()> {
+    for (name, value) in map {
+        if auth.is_some() && name.eq_ignore_ascii_case("Authorization") {
+            return Err("Authorization header can not be used with defined auth options".into());
         }
-    }
-    Ok(())
-}
 
-fn build_uri(base: UriSerde) -> Uri {
-    let base: Uri = base.into();
-    Uri::builder()
-        .scheme(base.scheme_str().unwrap_or("http"))
-        .authority(base.authority().map(|a| a.as_str()).unwrap_or("127.0.0.1"))
-        .path_and_query(base.path_and_query().map(|pq| pq.as_str()).unwrap_or(""))
-        .build()
-        .expect("bug building uri")
+        HeaderName::from_bytes(name.as_bytes()).with_context(|| InvalidHeaderName { name })?;
+        HeaderValue::from_bytes(value.as_bytes()).with_context(|| InvalidHeaderValue { value })?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -289,19 +296,25 @@ mod tests {
     use super::*;
     use crate::{
         assert_downcast_matches,
-        runtime::Runtime,
-        sinks::http::HttpSinkConfig,
-        sinks::util::http2::HttpSink,
-        test_util::{next_addr, random_lines_with_stream, shutdown_on_idle},
-        topology::config::SinkContext,
+        config::SinkContext,
+        sinks::{
+            http::HttpSinkConfig,
+            util::{http::HttpSink, test::build_test_server},
+        },
+        test_util::{next_addr, random_lines_with_stream},
     };
-    use bytes::Buf;
-    use futures01::{sync::mpsc, Future, Sink, Stream};
+    use bytes::buf::BufExt;
+    use flate2::read::GzDecoder;
+    use futures::{stream, StreamExt};
     use headers::{Authorization, HeaderMapExt};
-    use hyper::service::service_fn_ok;
-    use hyper::{Body, Request, Response, Server};
+    use hyper::Method;
     use serde::Deserialize;
     use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<HttpSinkConfig>();
+    }
 
     #[test]
     fn http_encode_event_text() {
@@ -309,7 +322,7 @@ mod tests {
         let event = Event::from("hello world");
 
         let mut config = default_config(Encoding::Text);
-        config.encoding = encoding.clone();
+        config.encoding = encoding;
         let bytes = config.encode_event(event).unwrap();
 
         assert_eq!(bytes, Vec::from(&"hello world\n"[..]));
@@ -321,7 +334,7 @@ mod tests {
         let event = Event::from("hello world");
 
         let mut config = default_config(Encoding::Json);
-        config.encoding = encoding.clone();
+        config.encoding = encoding;
         let bytes = config.encode_event(event).unwrap();
 
         #[derive(Deserialize, Debug)]
@@ -341,13 +354,13 @@ mod tests {
         let config = r#"
         uri = "http://$IN_ADDR/frames"
         encoding = "text"
-        [headers]
+        [request.headers]
         Auth = "token:thing_and-stuff"
         X-Custom-Nonsense = "_%_{}_-_&_._`_|_~_!_#_&_$_"
         "#;
         let config: HttpSinkConfig = toml::from_str(&config).unwrap();
 
-        assert!(super::validate_headers(&config.headers, &None).is_ok());
+        assert!(super::validate_headers(&config.request.headers, &None).is_ok());
     }
 
     #[test]
@@ -355,25 +368,27 @@ mod tests {
         let config = r#"
         uri = "http://$IN_ADDR/frames"
         encoding = "text"
-        [headers]
+        [request.headers]
         "\u0001" = "bad"
         "#;
         let config: HttpSinkConfig = toml::from_str(&config).unwrap();
 
         assert_downcast_matches!(
-            super::validate_headers(&config.headers, &None).unwrap_err(),
+            super::validate_headers(&config.request.headers, &None).unwrap_err(),
             BuildError,
             BuildError::InvalidHeaderName{..}
         );
     }
 
-    #[test]
+    // TODO: Fix failure on GH Actions using macos-latest image.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
     #[should_panic(expected = "Authorization header can not be used with defined auth options")]
-    fn http_headers_auth_conflict() {
+    async fn http_headers_auth_conflict() {
         let config = r#"
         uri = "http://$IN_ADDR/"
         encoding = "text"
-        [headers]
+        [request.headers]
         Authorization = "Basic base64encodedstring"
         [auth]
         strategy = "basic"
@@ -382,14 +397,13 @@ mod tests {
         "#;
         let config: HttpSinkConfig = toml::from_str(&config).unwrap();
 
-        let rt = Runtime::new().unwrap();
-        let cx = SinkContext::new_test(rt.executor());
+        let cx = SinkContext::new_test();
 
-        let _ = config.build(cx).unwrap();
+        let _ = config.build(cx).await.unwrap();
     }
 
-    #[test]
-    fn http_happy_path_post() {
+    #[tokio::test]
+    async fn http_happy_path_post() {
         let num_lines = 1000;
 
         let in_addr = next_addr();
@@ -407,51 +421,43 @@ mod tests {
         .replace("$IN_ADDR", &format!("{}", in_addr));
         let config: HttpSinkConfig = toml::from_str(&config).unwrap();
 
-        let mut rt = Runtime::new().unwrap();
-        let cx = SinkContext::new_test(rt.executor());
+        let cx = SinkContext::new_test();
 
-        let (sink, _) = config.build(cx).unwrap();
-        let (rx, trigger, server) = build_test_server(&in_addr);
+        let (sink, _) = config.build(cx).await.unwrap();
+        let (rx, trigger, server) = build_test_server(in_addr);
 
         let (input_lines, events) = random_lines_with_stream(100, num_lines);
-        let pump = sink.send_all(events);
+        let pump = sink.run(events);
 
-        rt.spawn(server);
+        tokio::spawn(server);
 
-        let _ = rt.block_on(pump).unwrap();
+        pump.await.unwrap();
         drop(trigger);
 
         let output_lines = rx
-            .wait()
-            .map(Result::unwrap)
-            .map(|(parts, body)| {
-                assert_eq!(hyper::Method::POST, parts.method);
+            .flat_map(|(parts, body)| {
+                assert_eq!(Method::POST, parts.method);
                 assert_eq!("/frames", parts.uri.path());
                 assert_eq!(
                     Some(Authorization::basic("waldo", "hunter2")),
                     parts.headers.typed_get()
                 );
-                body
+                stream::iter(BufReader::new(GzDecoder::new(body.reader())).lines())
             })
-            .map(hyper::Chunk::reader)
-            .map(flate2::read::GzDecoder::new)
-            .map(BufReader::new)
-            .flat_map(BufRead::lines)
             .map(Result::unwrap)
-            .map(|s| {
-                let val: serde_json::Value = serde_json::from_str(&s).unwrap();
+            .map(|line| {
+                let val: serde_json::Value = serde_json::from_str(&line).unwrap();
                 val.get("message").unwrap().as_str().unwrap().to_owned()
             })
-            .collect::<Vec<_>>();
-
-        shutdown_on_idle(rt);
+            .collect::<Vec<_>>()
+            .await;
 
         assert_eq!(num_lines, output_lines.len());
         assert_eq!(input_lines, output_lines);
     }
 
-    #[test]
-    fn http_happy_path_put() {
+    #[tokio::test]
+    async fn http_happy_path_put() {
         let num_lines = 1000;
 
         let in_addr = next_addr();
@@ -470,51 +476,43 @@ mod tests {
         .replace("$IN_ADDR", &format!("{}", in_addr));
         let config: HttpSinkConfig = toml::from_str(&config).unwrap();
 
-        let mut rt = Runtime::new().unwrap();
-        let cx = SinkContext::new_test(rt.executor());
+        let cx = SinkContext::new_test();
 
-        let (sink, _) = config.build(cx).unwrap();
-        let (rx, trigger, server) = build_test_server(&in_addr);
+        let (sink, _) = config.build(cx).await.unwrap();
+        let (rx, trigger, server) = build_test_server(in_addr);
 
         let (input_lines, events) = random_lines_with_stream(100, num_lines);
-        let pump = sink.send_all(events);
+        let pump = sink.run(events);
 
-        rt.spawn(server);
+        tokio::spawn(server);
 
-        let _ = rt.block_on(pump).unwrap();
+        pump.await.unwrap();
         drop(trigger);
 
         let output_lines = rx
-            .wait()
-            .map(Result::unwrap)
-            .map(|(parts, body)| {
-                assert_eq!(hyper::Method::PUT, parts.method);
+            .flat_map(|(parts, body)| {
+                assert_eq!(Method::PUT, parts.method);
                 assert_eq!("/frames", parts.uri.path());
                 assert_eq!(
                     Some(Authorization::basic("waldo", "hunter2")),
                     parts.headers.typed_get()
                 );
-                body
+                stream::iter(BufReader::new(GzDecoder::new(body.reader())).lines())
             })
-            .map(hyper::Chunk::reader)
-            .map(flate2::read::GzDecoder::new)
-            .map(BufReader::new)
-            .flat_map(BufRead::lines)
             .map(Result::unwrap)
-            .map(|s| {
-                let val: serde_json::Value = serde_json::from_str(&s).unwrap();
+            .map(|line| {
+                let val: serde_json::Value = serde_json::from_str(&line).unwrap();
                 val.get("message").unwrap().as_str().unwrap().to_owned()
             })
-            .collect::<Vec<_>>();
-
-        shutdown_on_idle(rt);
+            .collect::<Vec<_>>()
+            .await;
 
         assert_eq!(num_lines, output_lines.len());
         assert_eq!(input_lines, output_lines);
     }
 
-    #[test]
-    fn http_passes_custom_headers() {
+    #[tokio::test]
+    async fn http_passes_custom_headers() {
         let num_lines = 1000;
 
         let in_addr = next_addr();
@@ -523,32 +521,29 @@ mod tests {
         uri = "http://$IN_ADDR/frames"
         encoding = "ndjson"
         compression = "gzip"
-        [headers]
+        [request.headers]
         foo = "bar"
         baz = "quux"
     "#
         .replace("$IN_ADDR", &format!("{}", in_addr));
         let config: HttpSinkConfig = toml::from_str(&config).unwrap();
 
-        let mut rt = Runtime::new().unwrap();
-        let cx = SinkContext::new_test(rt.executor());
+        let cx = SinkContext::new_test();
 
-        let (sink, _) = config.build(cx).unwrap();
-        let (rx, trigger, server) = build_test_server(&in_addr);
+        let (sink, _) = config.build(cx).await.unwrap();
+        let (rx, trigger, server) = build_test_server(in_addr);
 
         let (input_lines, events) = random_lines_with_stream(100, num_lines);
-        let pump = sink.send_all(events);
+        let pump = sink.run(events);
 
-        rt.spawn(server);
+        tokio::spawn(server);
 
-        let _ = rt.block_on(pump).unwrap();
+        pump.await.unwrap();
         drop(trigger);
 
         let output_lines = rx
-            .wait()
-            .map(Result::unwrap)
-            .map(|(parts, body)| {
-                assert_eq!(hyper::Method::POST, parts.method);
+            .flat_map(|(parts, body)| {
+                assert_eq!(Method::POST, parts.method);
                 assert_eq!("/frames", parts.uri.path());
                 assert_eq!(
                     Some("bar"),
@@ -558,57 +553,70 @@ mod tests {
                     Some("quux"),
                     parts.headers.get("baz").map(|v| v.to_str().unwrap())
                 );
-                body
+                stream::iter(BufReader::new(GzDecoder::new(body.reader())).lines())
             })
-            .map(hyper::Chunk::reader)
-            .map(flate2::read::GzDecoder::new)
-            .map(BufReader::new)
-            .flat_map(BufRead::lines)
             .map(Result::unwrap)
-            .map(|s| {
-                let val: serde_json::Value = serde_json::from_str(&s).unwrap();
+            .map(|line| {
+                let val: serde_json::Value = serde_json::from_str(&line).unwrap();
                 val.get("message").unwrap().as_str().unwrap().to_owned()
             })
-            .collect::<Vec<_>>();
-
-        shutdown_on_idle(rt);
+            .collect::<Vec<_>>()
+            .await;
 
         assert_eq!(num_lines, output_lines.len());
         assert_eq!(input_lines, output_lines);
     }
 
-    fn build_test_server(
-        addr: &std::net::SocketAddr,
-    ) -> (
-        mpsc::Receiver<(http::request::Parts, hyper::Chunk)>,
-        stream_cancel::Trigger,
-        impl Future<Item = (), Error = ()>,
-    ) {
-        let (tx, rx) = mpsc::channel(100);
-        let service = move || {
-            let tx = tx.clone();
-            service_fn_ok(move |req: Request<Body>| {
-                let (parts, body) = req.into_parts();
+    #[tokio::test]
+    async fn json_compresion() {
+        let num_lines = 1000;
 
-                let tx = tx.clone();
-                tokio01::spawn(
-                    body.concat2()
-                        .map_err(|e| panic!(e))
-                        .and_then(|body| tx.send((parts, body)))
-                        .map(|_| ())
-                        .map_err(|e| panic!(e)),
+        let in_addr = next_addr();
+
+        let config = r#"
+        uri = "http://$IN_ADDR/frames"
+        compression = "gzip"
+        encoding = "json"
+
+        [auth]
+        strategy = "basic"
+        user = "waldo"
+        password = "hunter2"
+    "#
+        .replace("$IN_ADDR", &format!("{}", in_addr));
+        let config: HttpSinkConfig = toml::from_str(&config).unwrap();
+
+        let cx = SinkContext::new_test();
+
+        let (sink, _) = config.build(cx).await.unwrap();
+        let (rx, trigger, server) = build_test_server(in_addr);
+
+        let (input_lines, events) = random_lines_with_stream(100, num_lines);
+        let pump = sink.run(events);
+
+        tokio::spawn(server);
+
+        pump.await.unwrap();
+        drop(trigger);
+
+        let output_lines = rx
+            .flat_map(|(parts, body)| {
+                assert_eq!(Method::POST, parts.method);
+                assert_eq!("/frames", parts.uri.path());
+                assert_eq!(
+                    Some(Authorization::basic("waldo", "hunter2")),
+                    parts.headers.typed_get()
                 );
 
-                Response::new(Body::empty())
+                let lines: Vec<serde_json::Value> =
+                    serde_json::from_reader(GzDecoder::new(body.reader())).unwrap();
+                stream::iter(lines)
             })
-        };
+            .map(|line| line.get("message").unwrap().as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+            .await;
 
-        let (trigger, tripwire) = stream_cancel::Tripwire::new();
-        let server = Server::bind(addr)
-            .serve(service)
-            .with_graceful_shutdown(tripwire)
-            .map_err(|e| panic!("server error: {}", e));
-
-        (rx, trigger, server)
+        assert_eq!(num_lines, output_lines.len());
+        assert_eq!(input_lines, output_lines);
     }
 }

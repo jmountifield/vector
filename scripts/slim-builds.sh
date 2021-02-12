@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # slim-builds.sh
@@ -11,18 +11,11 @@ set -euo pipefail
 #   and this solves that.
 #
 
-# mkdir -p .cargo/
+mkdir -p .cargo/
 
-# cat <<-EOF >> ./.cargo/config
-# # focus on fast, lean builds
-# [build]
-# incremental = false
-# EOF
-
-# cat <<-EOF >> ./Cargo.toml
-# # focus on fast, lean builds
-# [profile.dev]
-# debug = false
-# opt-level = "s" # Binary size
-# lto = false # Don't LTO on CI
-# EOF
+cat <<-EOF >> ./.cargo/config
+[build]
+# On the CI, where this script runs, we won't be caching build artifacts.
+# so we don't need to keep these around.
+incremental = false
+EOF

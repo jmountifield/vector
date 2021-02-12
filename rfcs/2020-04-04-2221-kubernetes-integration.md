@@ -360,7 +360,7 @@ Kubernetes uses two log file formats, and both split log messages that are too
 long into multiple log records.
 
 It makes sense to automatically merge the log records that were split back
-together, similarly to how we do in the `docker` source.
+together, similarly to how we do in the `docker_logs` source.
 
 We will implement automatic partial event merging and enable it by default,
 while allowing users to opt-out of it if they need to.
@@ -1493,7 +1493,7 @@ We should also consider integrating with tools like [Vault] and [redoctober].
 - Suggest using [Pod Security Policies][k8s_docs_pod_security_policiy]
   ([API][k8s_api_pod_security_policy]).
 - Suggest using [NetworkPolicy][k8s_api_network_policy].
-- Suggest runnig [kube-bench].
+- Suggest running [kube-bench].
 - Suggest reading the
   [Kubernetes security documentation][k8s_docs_securing_a_cluster].
 
@@ -1597,11 +1597,11 @@ See [motivation](#motivation).
   - Vector deployment for Kubernetes Cluster Operators.
   - Vector deployment as a sidecar.
 - Revisit this RFC - see what we can focus on next.
-- Start the RFC of the Vector performance properies bulletin.
+- Start the RFC of the Vector performance properties bulletin.
   To include things like:
-  - Establish continius data gathering of performance characteristics of
+  - Establish continuous data gathering of performance characteristics of
     the bare Vector event pipeline (i.e. raw speed) and the impact of adding
-    each of it's components - sources, transforms, sinks - and their
+    each of its components - sources, transforms, sinks - and their
     combinations.
   - Prepare the format (and, if possible, automate the release of) Vector
     performance bulletin.

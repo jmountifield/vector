@@ -7,9 +7,9 @@ use std::{
 
 /// Iterates over all paths in form "a.b[0].c[1]" in alphabetical order
 /// and their corresponding values.
-pub fn all_fields<'a>(
-    fields: &'a BTreeMap<String, Value>,
-) -> impl Iterator<Item = (String, &'a Value)> + Serialize {
+pub fn all_fields(
+    fields: &BTreeMap<String, Value>,
+) -> impl Iterator<Item = (String, &Value)> + Serialize {
     FieldsIter::new(fields)
 }
 
@@ -68,7 +68,7 @@ impl<'a> FieldsIter<'a> {
         let mut path_iter = self.path.iter().chain(iter::once(&component)).peekable();
         loop {
             match path_iter.next() {
-                None => return String::from(res),
+                None => return res,
                 Some(PathComponent::Key(key)) => res.push_str(&key),
                 Some(PathComponent::Index(index)) => res.push_str(&format!("[{}]", index)),
             }

@@ -13,53 +13,53 @@ use tracing::{field, span, Event, Id, Metadata};
 use tracing_limit::Limit;
 use tracing_subscriber::layer::SubscriberExt;
 
-const INPUTS: &'static [usize] = &[1, 100, 500, 1000];
+const INPUTS: &[usize] = &[1, 100, 500, 1000];
 
 fn bench(c: &mut Criterion) {
-    c.bench_function_over_inputs(
-        "No Limit",
-        |b, n| {
+    let mut group = c.benchmark_group("No Limit");
+    for input in INPUTS {
+        group.bench_with_input(input.to_string(), input, |b, n| {
             let sub = VisitingSubscriber(Mutex::new(String::from("")));
             let n = black_box(n);
             tracing::subscriber::with_default(sub, || {
                 b.iter(|| {
-                    for _ in 0..**n {
+                    for _ in 0..*n {
                         info!(
-                            message = "hello world",
+                            message = "Hello world!",
                             foo = "foo",
                             bar = "bar",
                             baz = 3,
-                            quuux = field::debug(0.99),
+                            quuux = ?0.99,
                         )
                     }
                 })
             });
-        },
-        INPUTS,
-    );
+        });
+    }
+    group.finish();
 
-    c.bench_function_over_inputs(
-        "Limit 5 seconds",
-        |b, n| {
+    let mut group = c.benchmark_group("Limit 5 seconds");
+    for input in INPUTS {
+        group.bench_with_input(input.to_string(), input, |b, n| {
             let sub = VisitingSubscriber(Mutex::new(String::from(""))).with(Limit::default());
             let n = black_box(n);
             tracing::subscriber::with_default(sub, || {
                 b.iter(|| {
-                    for _ in 0..**n {
+                    for _ in 0..*n {
                         info!(
-                            message = "hello world",
+                            message = "Hello world!",
                             foo = "foo",
                             bar = "bar",
                             baz = 3,
-                            quuux = field::debug(0.99),
-                            rate_limit_secs = 5
+                            quuux = ?0.99,
+                            internal_log_rate_secs = 5
                         )
                     }
                 })
             });
-        },
-        INPUTS,
-    );
+        });
+    }
+    group.finish();
 }
 
 /// Simulates a subscriber that records span data.
