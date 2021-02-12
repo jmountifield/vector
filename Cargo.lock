@@ -2540,7 +2540,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "simpl",
- "smpl_jwt",
+ "smpl_jwt 0.5.0",
  "time 0.2.25",
  "tokio 0.2.25",
 ]
@@ -6716,6 +6716,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "smpl_jwt"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fb8aea73548d19a00cbaed99a48dbdc61fed3469f39d035617eefd7a88fffd0"
+dependencies = [
+ "base64 0.13.0",
+ "log",
+ "openssl",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "simpl",
+ "time 0.2.25",
+]
+
+[[package]]
 name = "snafu"
 version = "0.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8119,7 +8135,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shared",
- "smpl_jwt",
+ "smpl_jwt 0.6.0",
  "snafu",
  "snap",
  "socket2",
